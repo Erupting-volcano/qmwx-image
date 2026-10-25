@@ -1,0 +1,124 @@
+"""Image collection boundary for a parent project; independent of FastAPI."""
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+import hashlib
+import logging
+from typing import BinaryIO
+from uuid import UUID, uuid4
+
+from app.config import Settings
+from app.models.image_asset import ImageAsset
+from app.models.object_profile import ObjectProfile
+from app.modules.base import BaseProcessor
+from app.modules.image_metadata import ImageMetadataProcessor, InvalidImageError, inspect_image
+from app.services.pipeline import Pipeline
+from app.storage.local_storage import LocalStorage
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ImageInput:
+    """A filename for display and an open binary stream, owned by the caller."""
+
+    filename: str
+    stream: BinaryIO
+
+
+class CollectionError(ValueError):
+    """Expected invalid input; messages are safe for display by an adapter."""
+
+    def __init__(self, code: str, message: str, status_code: int = 422):
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+
+
+def _safe_filename(filename: str) -> str:
+    basename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    basename = "".join(character for character in basename if ord(character) >= 32)
+    return basename.strip()[:255] or "image"
+
+
+class ImageCollectionService:
+    """Collect and persist validated images with a versioned ObjectProfile output.
+
+    A parent project may call this class without starting HTTP or using the demo UI.
+    Streams are consumed from their current position and are never closed here.
+    """
+
+    def __init__(self, settings: Settings | None = None,
+                 processors: Sequence[BaseProcessor] | None = None,
+                 *, pipeline: Pipeline | None = None, storage: LocalStorage | None = None):
+        if pipeline is not None and processors is not None:
+            raise ValueError("Specify either processors or pipeline")
+        self.settings = settings or Settings()
+        self.storage = storage or LocalStorage(self.settings.data_dir)
+        self.pipeline = pipeline or Pipeline(
+            [ImageMetadataProcessor()] if processors is None else processors
+        )
+
+    def collect(self, name: str, images: Sequence[ImageInput]) -> ObjectProfile:
+        """Validate the whole batch, run registered processors, atomically save it."""
+        if not isinstance(name, str):
+            raise CollectionError("invalid_name", "请填写物体名称。")
+        name = name.strip()
+        if not name or len(name) > 120 or any(ord(character) < 32 for character in name):
+            raise CollectionError("invalid_name", "物体名称需要为 1–120 个字符，且不含控制字符。")
+        if not images or len(images) > self.settings.max_files:
+            raise CollectionError("invalid_images", f"请选择 1–{self.settings.max_files} 张图片。")
+        if any(not isinstance(image, ImageInput) or not isinstance(image.filename, str)
+               or not callable(getattr(image.stream, "read", None)) for image in images):
+            raise CollectionError("invalid_images", "图片输入需要包含文件名和可读取的二进制流。")
+
+        object_id = uuid4()
+        total_bytes = 0
+        with self.storage.transaction(object_id) as transaction:
+            assets: list[ImageAsset] = []
+            for image in images:
+                asset_id = uuid4()
+                filename = _safe_filename(image.filename)
+                temporary_image = transaction.images_dir / f"{asset_id}.upload"
+                size_bytes = 0
+                digest = hashlib.sha256()
+                with temporary_image.open("xb") as handle:
+                    while chunk := image.stream.read(1024 * 1024):
+                        if not isinstance(chunk, bytes):
+                            raise CollectionError("invalid_images", "图片流必须提供二进制数据。")
+                        size_bytes += len(chunk)
+                        total_bytes += len(chunk)
+                        if size_bytes > self.settings.max_image_bytes:
+                            raise CollectionError("image_too_large", f"图片“{filename}”超过单张大小限制。", 413)
+                        if total_bytes > self.settings.max_total_bytes:
+                            raise CollectionError("upload_too_large", "本次图片总大小超过限制。", 413)
+                        handle.write(chunk)
+                        digest.update(chunk)
+                try:
+                    metadata = inspect_image(temporary_image, max_pixels=self.settings.max_image_pixels)
+                except InvalidImageError as exc:
+                    raise CollectionError(exc.code, f"图片“{filename}”：{exc}", exc.status_code) from exc
+                extension = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp"}[metadata["image_format"]]
+                temporary_image.rename(temporary_image.with_suffix(f".{extension}"))
+                assets.append(ImageAsset(
+                    asset_id=asset_id, filename=filename,
+                    storage_path=f"objects/{object_id}/images/{asset_id}.{extension}",
+                    mime_type=metadata["mime_type"], image_format=metadata["image_format"],
+                    width=metadata["width"], height=metadata["height"],
+                    size_bytes=size_bytes, checksum=digest.hexdigest(),
+                ))
+
+            initial = self.pipeline.assembler.create_profile(name, assets, object_id=object_id)
+            profile = self.pipeline.run(initial, transaction.data_dir,
+                                        max_image_pixels=self.settings.max_image_pixels)
+            payload = transaction.save_profile(profile)
+            transaction.commit()
+        logger.info("Image collection %s saved: %s images, status=%s", object_id, len(assets), profile.status)
+        # Return the exact contract representation which was persisted.
+        return ObjectProfile.model_validate(payload)
+
+    def get_profile(self, object_id: UUID | str) -> ObjectProfile:
+        """Read a previously persisted collection, including after a process restart."""
+        profile, _ = self.storage.read_profile(UUID(str(object_id)))
+        return profile

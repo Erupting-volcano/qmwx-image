@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#f4f5ef" />
+    <title>其命维新 · 物体数字化模块</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="site-header">
+        <a class="brand" href="/" aria-label="其命维新物体数字化模块首页">
+          <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="m12 2 9 5v10l-9 5-9-5V7l9-5Z" stroke="currentColor" stroke-width="1.5"/><path d="m3 7 9 5 9-5M12 12v10M7.5 4.5l9 5" stroke="currentColor" stroke-width="1.5"/></svg></span>
+          <span>其命维新<span class="brand-caption">OBJECT DIGITIZATION MODULE</span></span>
+        </a>
+        <span class="version-badge"><span class="status-dot" aria-hidden="true"></span>模块调试入口 <span class="version">V0.1</span></span>
+      </header>
+
+      <main>
+        <section class="intro" aria-labelledby="page-title">
+          <div class="intro-copy">
+            <p class="eyebrow">物体信息输入与数字化模块</p>
+            <h1 id="page-title">为主项目收集<br /><span>可追溯的图片信息。</span></h1>
+            <p class="intro-description">上传同一旧物的多张照片，校验图片并提取基础信息。此页面用于独立调试，标准化档案可交给主项目，用于后续改造设计与几何验证。</p>
+          </div>
+          <aside class="scope-note" aria-labelledby="scope-title">
+            <span class="note-symbol" aria-hidden="true">i</span>
+            <div>
+              <h2 id="scope-title">当前模块的处理范围</h2>
+              <p>当前仅提取图片格式、像素尺寸与文件大小。物体类别、真实尺寸、材质与 3D 模型仍为未知，档案会明确记录待补信息。</p>
+            </div>
+          </aside>
+        </section>
+
+        <section class="workspace" aria-labelledby="upload-title">
+          <div class="section-heading">
+            <div><p class="eyebrow">01 / 图片采集</p><h2 id="upload-title">收集物体图片信息</h2></div>
+            <span class="step-label">图片 → 基础信息 → JSON 档案</span>
+          </div>
+          <form id="upload-form" novalidate>
+            <fieldset id="upload-fields">
+              <legend class="visually-hidden">物体信息与照片</legend>
+              <div class="name-field">
+                <label for="object-name">物体名称 <span class="required-label">必填</span></label>
+                <input id="object-name" name="name" type="text" maxlength="120" placeholder="例如：书桌上的白色陶瓷杯" autocomplete="off" required aria-describedby="name-hint" />
+                <p class="field-hint" id="name-hint">一个方便你之后查找的名字，最多 120 个字符。</p>
+              </div>
+
+              <div class="photos-heading"><label for="image-input">物体照片 <span class="required-label">必填</span></label><span id="selection-summary">尚未选择</span></div>
+              <div id="drop-zone" class="drop-zone">
+                <span class="upload-symbol" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+                <p class="drop-title">拖入照片，或点击选择</p>
+                <p id="drop-description" class="drop-description">JPEG、PNG、WebP · 单张最多 15 MiB</p>
+                <label class="file-picker" for="image-input">选择照片</label>
+                <input id="image-input" name="images" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" multiple aria-describedby="upload-hint" />
+              </div>
+              <p id="upload-hint" class="field-hint upload-hint">最多 20 张，合计不超过 100 MiB。手机 HEIC / HEIF 照片需先转换为 JPEG、PNG 或 WebP。</p>
+
+              <div id="file-list" class="file-list" aria-label="已选择的图片"></div>
+              <div id="selection-actions" class="selection-actions" hidden><button id="clear-files" type="button" class="text-button">清空已选照片</button><p>可继续添加其他视角的照片</p></div>
+            </fieldset>
+
+            <div id="form-error" class="message message-error" role="alert" hidden></div>
+            <div class="form-footer">
+              <p class="privacy-note"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 2 4 4.5V9c0 4 6 8 6 8s6-4 6-8V4.5L10 2Z" stroke="currentColor" stroke-width="1.3"/><path d="m7 9 2 2 4-4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>上传与档案保存在运行本服务的设备上</p>
+              <button id="submit-button" class="primary-button" type="submit"><span id="submit-label">建立数字档案</span><span id="submit-arrow" aria-hidden="true">↗</span><span id="submit-spinner" class="spinner" hidden aria-hidden="true"></span></button>
+            </div>
+            <p id="upload-status" class="upload-status" role="status" aria-live="polite"></p>
+          </form>
+        </section>
+
+        <section id="result-section" class="result-section" aria-labelledby="result-title" hidden>
+          <div class="section-heading result-heading"><div><p class="eyebrow">02 / 数字档案</p><h2 id="result-title">档案已建立</h2></div><span id="result-status" class="result-status"></span></div>
+          <div id="result-announcement" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+          <div class="result-card">
+            <div class="profile-header"><div><p class="eyebrow">OBJECT PROFILE</p><h3 id="profile-name" tabindex="-1"></h3><p id="profile-id" class="profile-id"></p></div><span class="archive-symbol" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none"><path d="m20 5 13 7.5v15L20 35 7 27.5v-15L20 5Z" stroke="currentColor" stroke-width="1.5"/><path d="m7 12.5 13 7.5 13-7.5M20 20v15" stroke="currentColor" stroke-width="1.5"/></svg></span></div>
+            <dl id="profile-facts" class="profile-facts"></dl>
+            <div class="result-details"><section><h4>已记录的图片</h4><ul id="result-images" class="result-images"></ul></section><section><h4>待补充的信息</h4><ul id="missing-information" class="missing-list"></ul></section></div>
+            <section id="warnings-section" class="warnings-section" hidden><h4>处理提示</h4><ul id="warnings-list"></ul></section>
+            <details class="json-details"><summary>查看完整档案 JSON <span>结构化原始记录</span></summary><pre id="profile-json" tabindex="0" aria-label="完整档案 JSON"></pre></details>
+            <div class="result-footer"><p>档案已保存，可继续用于后续处理。</p><div class="result-links"><a id="view-json" class="secondary-button" target="_blank" rel="noopener">在线查看 JSON <span aria-hidden="true">↗</span></a><a id="download-json" class="download-button" download>下载 JSON <span aria-hidden="true">↓</span></a></div></div>
+          </div>
+        </section>
+      </main>
+      <footer class="site-footer"><p>其命维新 <span>·</span> 物体数字化模块 V0.1</p><p>为旧物改造收集可验证的数据。</p></footer>
+    </div>
+  </body>
+</html>

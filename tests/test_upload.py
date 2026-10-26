@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -54,6 +55,7 @@ def test_upload_supported_formats_and_persist(client, settings, image_format, fi
     assert (asset["width"], asset["height"]) == (32, 24)
     assert asset["mime_type"] == mime
     assert asset["size_bytes"] == len(content)
+    assert asset["checksum"] == hashlib.sha256(content).hexdigest()
     relative = Path(asset["storage_path"])
     assert not relative.is_absolute()
     assert ".." not in relative.parts
@@ -89,6 +91,22 @@ def test_created_fetched_downloaded_and_saved_json_are_identical(client, setting
     assert "attachment" in downloaded.headers["content-disposition"]
     persisted = (settings.data_dir / "objects" / object_id / "profile.json").read_bytes()
     assert created["profile"] == fetched.json() == downloaded.json() == json.loads(persisted)
+    assert set(created) == {"object_id", "status", "profile"}
+    assert set(created["profile"]) == {
+        "schema_version", "object_id", "name", "created_at", "status", "images", "category",
+        "materials", "measurements", "geometry", "components", "component_relations",
+        "missing_information", "processing_results", "warnings",
+    }
+    assert created["profile"]["schema_version"] == "0.1.0"
+    assert set(created["profile"]["images"][0]) == {
+        "asset_id", "filename", "storage_path", "mime_type", "image_format", "width", "height",
+        "size_bytes", "checksum",
+    }
+    result = created["profile"]["processing_results"][0]
+    assert set(result) == {"module_name", "status", "data", "warnings", "errors"}
+    assert set(result["data"]["images"][0]) == {
+        "asset_id", "image_format", "mime_type", "width", "height", "size_bytes",
+    }
     assert ObjectProfile.model_validate_json(persisted).object_id == UUID(object_id)
 
 
@@ -157,6 +175,15 @@ def test_batch_size_limit(client_factory, png_bytes):
         files=[("images", ("one.png", png_bytes, "image/png")), ("images", ("two.png", png_bytes, "image/png"))],
     )
     assert_safe_error(response, 413)
+
+
+def test_single_image_limit_error_takes_priority_when_both_byte_limits_are_exceeded(client_factory, png_bytes):
+    client, settings = client_factory(max_image_bytes=len(png_bytes) - 1, max_total_bytes=len(png_bytes) - 2)
+    response = upload(client, png_bytes)
+    assert_safe_error(response, 413)
+    assert response.json()["detail"]["code"] == "image_too_large"
+    assert not list(settings.data_dir.rglob("profile.json"))
+    assert not list((settings.data_dir / ".staging").iterdir())
 
 
 def test_file_count_limit(client_factory, png_bytes):

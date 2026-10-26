@@ -2,7 +2,6 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-import hashlib
 import logging
 from typing import BinaryIO
 from uuid import UUID, uuid4
@@ -11,7 +10,7 @@ from app.config import Settings
 from app.models.image_asset import ImageAsset
 from app.models.object_profile import ObjectProfile
 from app.modules.base import BaseProcessor
-from app.modules.image_metadata import ImageMetadataProcessor, InvalidImageError, inspect_image
+from app.modules.image_metadata import ImageMetadataProcessor, InspectedImage, InvalidImageError
 from app.services.pipeline import Pipeline
 from app.storage.local_storage import LocalStorage
 
@@ -77,41 +76,43 @@ class ImageCollectionService:
         total_bytes = 0
         with self.storage.transaction(object_id) as transaction:
             assets: list[ImageAsset] = []
+            inspected_images: dict[UUID, InspectedImage] = {}
             for image in images:
                 asset_id = uuid4()
                 filename = _safe_filename(image.filename)
-                temporary_image = transaction.images_dir / f"{asset_id}.upload"
-                size_bytes = 0
-                digest = hashlib.sha256()
-                with temporary_image.open("xb") as handle:
-                    while chunk := image.stream.read(1024 * 1024):
-                        if not isinstance(chunk, bytes):
-                            raise CollectionError("invalid_images", "图片流必须提供二进制数据。")
-                        size_bytes += len(chunk)
-                        total_bytes += len(chunk)
-                        if size_bytes > self.settings.max_image_bytes:
-                            raise CollectionError("image_too_large", f"图片“{filename}”超过单张大小限制。", 413)
-                        if total_bytes > self.settings.max_total_bytes:
-                            raise CollectionError("upload_too_large", "本次图片总大小超过限制。", 413)
-                        handle.write(chunk)
-                        digest.update(chunk)
+                byte_budget = min(self.settings.max_image_bytes,
+                                  self.settings.max_total_bytes - total_bytes)
                 try:
-                    metadata = inspect_image(temporary_image, max_pixels=self.settings.max_image_pixels)
+                    temporary_image, size_bytes, checksum = transaction.stage_image(
+                        image.stream, asset_id, byte_budget
+                    )
+                except OverflowError as exc:
+                    # Preserve single-image error precedence when one read exceeds both limits.
+                    if exc.args[0] > self.settings.max_image_bytes:
+                        raise CollectionError("image_too_large", f"图片“{filename}”超过单张大小限制。", 413) from exc
+                    raise CollectionError("upload_too_large", "本次图片总大小超过限制。", 413) from exc
+                except TypeError as exc:
+                    raise CollectionError("invalid_images", "图片流必须提供二进制数据。") from exc
+                total_bytes += size_bytes
+                try:
+                    inspection = InspectedImage(temporary_image, max_pixels=self.settings.max_image_pixels)
+                    metadata = inspection.metadata
                 except InvalidImageError as exc:
                     raise CollectionError(exc.code, f"图片“{filename}”：{exc}", exc.status_code) from exc
-                extension = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp"}[metadata["image_format"]]
-                temporary_image.rename(temporary_image.with_suffix(f".{extension}"))
+                storage_path = transaction.finalize_image(temporary_image, metadata["image_format"])
+                inspected_images[asset_id] = inspection
                 assets.append(ImageAsset(
                     asset_id=asset_id, filename=filename,
-                    storage_path=f"objects/{object_id}/images/{asset_id}.{extension}",
+                    storage_path=storage_path,
                     mime_type=metadata["mime_type"], image_format=metadata["image_format"],
                     width=metadata["width"], height=metadata["height"],
-                    size_bytes=size_bytes, checksum=digest.hexdigest(),
+                    size_bytes=size_bytes, checksum=checksum,
                 ))
 
             initial = self.pipeline.assembler.create_profile(name, assets, object_id=object_id)
             profile = self.pipeline.run(initial, transaction.data_dir,
-                                        max_image_pixels=self.settings.max_image_pixels)
+                                        max_image_pixels=self.settings.max_image_pixels,
+                                        inspected_images=inspected_images)
             payload = transaction.save_profile(profile)
             transaction.commit()
         logger.info("Image collection %s saved: %s images, status=%s", object_id, len(assets), profile.status)

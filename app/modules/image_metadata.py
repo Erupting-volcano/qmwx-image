@@ -1,6 +1,7 @@
 """Actual static image decoding and a minimal working processing module."""
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -59,6 +60,59 @@ def inspect_image(path: Path, max_pixels: int = 40_000_000) -> dict:
         raise InvalidImageError("图片无法完整解码，文件可能损坏或格式不受支持") from exc
 
 
+@dataclass(frozen=True, init=False, slots=True)
+class InspectedImage:
+    """A call-local receipt, created only by fully inspecting a real file.
+
+    The same-stem rule permits the transaction's .upload-to-format rename, while
+    the fingerprint rejects a replaced or modified file. No receipt is persisted.
+    """
+
+    _stem_path: Path
+    _fingerprint: tuple[int, int, int, int]
+    _metadata_items: tuple[tuple[str, str | int], ...]
+    _max_pixels: int
+
+    def __init__(self, path: Path, max_pixels: int = 40_000_000) -> None:
+        try:
+            source = Path(path).resolve()
+            before = self._file_fingerprint(source)
+            metadata = inspect_image(source, max_pixels)
+            after = self._file_fingerprint(source)
+        except OSError as exc:
+            raise InvalidImageError("图片无法读取，请重新选择文件") from exc
+        if before != after:
+            raise InvalidImageError("图片在验证期间发生变化，请重新选择文件")
+        object.__setattr__(self, "_stem_path", source.with_suffix(""))
+        object.__setattr__(self, "_fingerprint", after)
+        object.__setattr__(self, "_metadata_items", tuple(metadata.items()))
+        object.__setattr__(self, "_max_pixels", max_pixels)
+
+    @staticmethod
+    def _file_fingerprint(path: Path) -> tuple[int, int, int, int]:
+        info = path.stat()
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+    @property
+    def metadata(self) -> dict:
+        """Return a copy of the metadata produced by the completed inspection."""
+        return dict(self._metadata_items)
+
+    def metadata_if_unchanged(self, path: Path, max_pixels: int = 40_000_000) -> dict | None:
+        """Return a fresh metadata dict only for the same file and safety limit."""
+        if max_pixels < self._max_pixels or max_pixels <= 0:
+            return None
+        try:
+            source = Path(path).resolve()
+            if source.with_suffix("") != self._stem_path:
+                return None
+            if self._file_fingerprint(source) != self._fingerprint:
+                return None
+        except (OSError, ValueError):
+            return None
+        return self.metadata
+
+
 class ImageMetadataProcessor(BaseProcessor):
     name = "image_metadata"
 
@@ -67,7 +121,14 @@ class ImageMetadataProcessor(BaseProcessor):
         errors: list[ProcessingError] = []
         for asset in context.images:
             try:
-                metadata = inspect_image(context.resolve_asset(asset), context.max_image_pixels)
+                path = context.resolve_asset(asset)
+                inspection = context.inspected_images.get(asset.asset_id)
+                metadata = (
+                    inspection.metadata_if_unchanged(path, context.max_image_pixels)
+                    if type(inspection) is InspectedImage else None
+                )
+                if metadata is None:
+                    metadata = inspect_image(path, context.max_image_pixels)
                 images.append(ImageMetadata(asset_id=asset.asset_id, **metadata))
             except Exception:
                 error_id = uuid4()

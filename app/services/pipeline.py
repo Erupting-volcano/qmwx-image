@@ -1,14 +1,20 @@
 """Sequential execution with isolated processor snapshots and failure boundaries."""
 
+from __future__ import annotations
+
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from uuid import uuid4
+from typing import TYPE_CHECKING
+from uuid import UUID, uuid4
 
 from app.models.object_profile import ObjectProfile
 from app.models.processing_result import ProcessingError, ProcessingResult
 from app.modules.base import BaseProcessor, ProcessingContext
 from app.services.profile_assembler import ProfileAssembler
+
+if TYPE_CHECKING:
+    from app.modules.image_metadata import InspectedImage
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,7 @@ class Pipeline:
 
     def run(
         self, profile: ObjectProfile, data_dir: Path, max_image_pixels: int = 40_000_000,
+        *, inspected_images: Mapping[UUID, InspectedImage] | None = None,
     ) -> ObjectProfile:
         if max_image_pixels <= 0:
             raise ValueError("图片像素限制必须大于零")
@@ -32,13 +39,12 @@ class Pipeline:
         for processor in self.processors:
             snapshot = current.model_copy(deep=True)
             context = ProcessingContext(
-                images=tuple(image.model_copy(deep=True) for image in snapshot.images),
+                images=tuple(snapshot.images),
                 data_dir=Path(data_dir),
                 profile=snapshot,
-                previous_results=tuple(
-                    result.model_copy(deep=True) for result in current.processing_results
-                ),
+                previous_results=tuple(snapshot.processing_results),
                 max_image_pixels=max_image_pixels,
+                inspected_images=inspected_images or {},
             )
             try:
                 result = processor.process(context)

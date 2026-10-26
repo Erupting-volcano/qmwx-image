@@ -1,12 +1,21 @@
 """Stable module interface, independent of HTTP and persistence."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING
+from uuid import UUID
 
 from app.models.image_asset import ImageAsset
 from app.models.object_profile import ObjectProfile
 from app.models.processing_result import ProcessingResult
+
+if TYPE_CHECKING:
+    from app.modules.image_metadata import InspectedImage
 
 
 @dataclass(frozen=True)
@@ -16,6 +25,11 @@ class ProcessingContext:
     profile: ObjectProfile | None = None
     previous_results: tuple[ProcessingResult, ...] = ()
     max_image_pixels: int = 40_000_000
+    inspected_images: Mapping[UUID, InspectedImage] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Each module gets a read-only copy; the receipts themselves are immutable.
+        object.__setattr__(self, "inspected_images", MappingProxyType(dict(self.inspected_images)))
 
     def resolve_asset(self, asset: ImageAsset) -> Path:
         """Resolve below the data root, also rejecting symlinks escaping that root."""

@@ -116,15 +116,11 @@ async def create_object(request: Request) -> dict:
             raise api_error(422, "invalid_upload_form", "表单只接受物体名称和图片。")
         if len(names) != 1 or not isinstance(names[0], str):
             raise api_error(422, "invalid_name", "请填写一个物体名称。")
-        name = names[0].strip()
-        if not name or len(name) > 120 or any(ord(character) < 32 for character in name):
-            raise api_error(422, "invalid_name", "物体名称需要为 1–120 个字符，且不含控制字符。")
-        if not uploads or len(uploads) > settings.max_files or any(
-                not isinstance(upload, UploadFile) for upload in uploads):
+        if any(not isinstance(upload, UploadFile) for upload in uploads):
             raise api_error(422, "invalid_images", f"请选择 1–{settings.max_files} 张图片。")
         images = [ImageInput(upload.filename or "image", upload.file) for upload in uploads]
         try:
-            profile = await run_in_threadpool(request.app.state.collection_service.collect, name, images)
+            profile = await run_in_threadpool(request.app.state.collection_service.collect, names[0], images)
         except CollectionError as exc:
             raise api_error(exc.status_code, exc.code, str(exc)) from exc
         return {"object_id": str(profile.object_id), "status": profile.status,

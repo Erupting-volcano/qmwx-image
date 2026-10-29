@@ -11,6 +11,7 @@ from app.models.image_asset import ImageAsset
 from app.models.object_profile import ObjectProfile
 from app.modules.base import BaseProcessor
 from app.modules.image_metadata import ImageMetadataProcessor, InspectedImage, InvalidImageError
+from app.modules.image_quality import ImageQualityProcessor
 from app.services.pipeline import Pipeline
 from app.storage.local_storage import LocalStorage
 
@@ -56,7 +57,7 @@ class ImageCollectionService:
         self.settings = settings or Settings()
         self.storage = storage or LocalStorage(self.settings.data_dir)
         self.pipeline = pipeline or Pipeline(
-            [ImageMetadataProcessor()] if processors is None else processors
+            [ImageMetadataProcessor(), ImageQualityProcessor()] if processors is None else processors
         )
 
     def collect(self, name: str, images: Sequence[ImageInput]) -> ObjectProfile:

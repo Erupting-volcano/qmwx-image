@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 from app.models.image_asset import ImageAsset
+from app.models.image_quality import ImageQualityData
 from app.models.object_profile import ObjectProfile
 from app.models.processing_result import ImageMetadataData, ProcessingError, ProcessingResult
 
@@ -26,6 +27,7 @@ class ProfileAssembler:
     def __init__(self) -> None:
         self._adapters: dict[str, _AdapterRegistration] = {
             "image_metadata": _AdapterRegistration(self._merge_image_metadata, editable_images=True),
+            "image_quality": _AdapterRegistration(self._validate_image_quality),
         }
 
     def register_adapter(self, module_name: str, adapter: ProfileAdapter) -> None:
@@ -42,6 +44,22 @@ class ProfileAssembler:
         if object_id is not None:
             fields["object_id"] = object_id
         return ObjectProfile.model_validate(fields)
+
+    @staticmethod
+    def _validate_image_quality(profile: ObjectProfile, result: ProcessingResult) -> ObjectProfile:
+        """Validate quality records against this archive without changing its facts."""
+        payload = ImageQualityData.model_validate(result.data)
+        known_images = {image.asset_id: image for image in profile.images}
+        if payload.input_count != len(known_images):
+            raise ValueError("质量评估的输入数量与档案不一致")
+        checked_ids = {image.asset_id for image in payload.images}
+        if not checked_ids.issubset(known_images):
+            raise ValueError("质量评估引用了不属于当前档案的图片")
+        if any(image.filename != known_images[image.asset_id].filename for image in payload.images):
+            raise ValueError("质量评估的文件名与图片资源不一致")
+        if result.status == "success" and checked_ids != set(known_images):
+            raise ValueError("成功的质量评估必须覆盖当前档案的所有图片")
+        return profile
 
     @staticmethod
     def _merge_image_metadata(profile: ObjectProfile, result: ProcessingResult) -> ObjectProfile:

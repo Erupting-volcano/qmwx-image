@@ -11,6 +11,7 @@
     "result-section", "result-status", "result-announcement", "profile-name", "profile-id",
     "profile-facts", "result-images", "missing-information", "warnings-section",
     "warnings-list", "profile-json", "view-json", "download-json", "drop-description", "upload-hint",
+    "quality-summary", "quality-images",
   ].map((id) => [id, document.getElementById(id)]));
 
   let selectedFiles = [];
@@ -238,6 +239,65 @@
     return typeof label === "string" ? fieldLabels[label] || label : JSON.stringify(value);
   }
 
+  function renderQuality(profile, images) {
+    const results = Array.isArray(profile.processing_results) ? profile.processing_results : [];
+    // A profile may retain several processing runs; use the latest quality assessment.
+    const result = [...results].reverse().find((item) => item?.module_name === "image_quality");
+    const records = ["success", "partial"].includes(result?.status) && Array.isArray(result?.data?.images) ? result.data.images : [];
+    const byId = new Map(records.filter((item) => typeof item?.asset_id === "string").map((item) => [item.asset_id, item]));
+    const errors = Array.isArray(result?.errors) ? result.errors : [];
+    const errorById = new Map(errors.filter((item) => typeof item?.asset_id === "string").map((item) => [item.asset_id, item]));
+    const checked = images.filter((asset) => ["good", "review"].includes(byId.get(asset.asset_id)?.status));
+    const reviewCount = checked.filter((asset) => byId.get(asset.asset_id).status === "review").length;
+    elements["quality-summary"].textContent = result
+      ? `已评估 ${checked.length} / ${images.length} 张图片，${reviewCount} 张建议复查。${checked.length < images.length ? "未完成评估的图片见下方。" : ""}`
+      : "本份档案未执行图像质量评估，不能据此判断照片质量。";
+
+    const issueLabels = {
+      low_resolution: "分辨率偏低",
+      too_dark: "画面整体偏暗",
+      too_bright: "画面整体偏亮",
+      low_contrast: "整体对比度偏低",
+      low_detail: "细节响应较弱，建议人工复查",
+    };
+    const formatMetric = (value) => Number.isFinite(value) ? value.toFixed(2) : "未取得";
+    elements["quality-images"].replaceChildren();
+    images.forEach((asset, index) => {
+      const assessment = byId.get(asset.asset_id);
+      const isChecked = ["good", "review"].includes(assessment?.status);
+      const needsReview = isChecked && assessment.status === "review";
+      const error = errorById.get(asset.asset_id);
+      const item = createNode("li", `quality-image${needsReview || !isChecked ? " needs-review" : ""}`);
+      const heading = createNode("div", "quality-image-heading");
+      const label = isChecked ? (needsReview ? "建议复查" : "未发现明显问题") : (result ? "评估未完成" : "未评估");
+      heading.append(
+        createNode("h5", "quality-image-name", `${String(index + 1).padStart(2, "0")}  ${asset.filename || "未命名图片"}`),
+        createNode("span", `quality-badge${needsReview || !isChecked ? " is-review" : ""}`, label),
+      );
+      item.append(heading);
+      if (isChecked) {
+        item.append(createNode("p", "quality-metrics", `平均亮度 ${formatMetric(assessment.mean_luminance)} / 255 · 对比度 ${formatMetric(assessment.contrast_stddev)} · 边缘响应 ${formatMetric(assessment.edge_strength)}`));
+        if (Number.isFinite(assessment.analysis_width) && Number.isFinite(assessment.analysis_height)) {
+          item.append(createNode("p", "quality-analysis-size", `分析尺寸 ${assessment.analysis_width} × ${assessment.analysis_height} px；指标用于启发式复查。`));
+        }
+        const issues = Array.isArray(assessment.issues) ? assessment.issues.filter((value) => typeof value === "string") : [];
+        if (issues.length) item.append(createNode("p", "quality-issues", `复查项：${issues.map((code) => issueLabels[code] || code).join("、")}`));
+        const suggestions = Array.isArray(assessment.suggestions) ? assessment.suggestions.filter((value) => typeof value === "string") : [];
+        if (suggestions.length) {
+          const list = createNode("ul", "quality-suggestions");
+          suggestions.forEach((suggestion) => list.append(createNode("li", "", suggestion)));
+          item.append(list);
+        }
+      } else {
+        const message = typeof error?.message === "string" ? error.message
+          : result ? "这张图片未完成质量评估，请稍后重新处理；原始图片与档案仍已保留。" : "本次处理没有这张图片的质量评估结果。";
+        item.append(createNode("p", "quality-issues", message));
+      }
+      elements["quality-images"].append(item);
+    });
+    if (!images.length) elements["quality-images"].append(createNode("li", "quality-note", "暂无可评估的图片记录。"));
+  }
+
   function renderResult(payload) {
     const profile = payload.profile;
     const objectId = payload.object_id;
@@ -284,6 +344,7 @@
       elements["result-images"].append(item);
     });
     if (!images.length) elements["result-images"].append(createNode("li", "result-image-meta", "暂无可用图片记录"));
+    renderQuality(profile, images);
 
     elements["missing-information"].replaceChildren();
     let missing = profile.missing_information;
@@ -371,7 +432,7 @@
     formData.append("name", name);
     selectedFiles.forEach((entry) => formData.append("images", entry.file, entry.file.name));
     setBusy(true);
-    elements["upload-status"].textContent = "正在上传并提取基础信息，请保持页面打开…";
+    elements["upload-status"].textContent = "正在上传、提取基础信息并评估图像质量，请保持页面打开…";
     try {
       const response = await fetch("/api/v1/objects", { method: "POST", body: formData, headers: { Accept: "application/json" } });
       let payload;

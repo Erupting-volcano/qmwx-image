@@ -1,4 +1,4 @@
-"""Box-guided SAM 2 masks, using the caller's image validation and transaction."""
+"""Box-guided cloud masks, using validated images and the existing transaction."""
 
 import logging
 import math
@@ -13,14 +13,15 @@ from app.models.segmentation import NormalizedBox, SegmentationData, Segmentatio
 from app.models.processing_result import ProcessingError, ProcessingResult
 from app.modules import image_metadata
 from app.modules.base import BaseProcessor, ProcessingContext
-from app.modules.sam2_backend import MaskPrediction, Sam2Backend, SegmentationUnavailable
+from app.modules.baidu_backend import BaiduSegmentationBackend
+from app.modules.segmentation_backend import MaskPrediction, SegmentationAPIError, SegmentationUnavailable
 
 
 logger = logging.getLogger(__name__)
 MIN_REVIEW_AREA_RATIO = 0.001
 MAX_REVIEW_AREA_RATIO = 0.98
 MIN_REVIEW_MASK_SCORE = 0.7
-TARGET_REVIEW_NOTE = "请人工核对掩码是否覆盖所选目标；模型质量分数不是目标识别正确率。"
+TARGET_REVIEW_NOTE = "请人工核对掩码是否覆盖所选目标；分割结果不保证目标身份或边界正确。"
 
 
 class ObjectSegmentationProcessor(BaseProcessor):
@@ -28,8 +29,9 @@ class ObjectSegmentationProcessor(BaseProcessor):
 
     def __init__(self, settings: Settings | None = None, *, backend=None) -> None:
         self.settings = settings or Settings()
-        self.backend = backend if backend is not None else Sam2Backend(
-            self.settings.segmentation_checkpoint, self.settings.segmentation_device,
+        self.backend = backend if backend is not None else BaiduSegmentationBackend(
+            self.settings.segmentation_api_key, self.settings.segmentation_secret_key,
+            self.settings.segmentation_timeout_seconds,
         )
 
     @staticmethod
@@ -91,10 +93,10 @@ class ObjectSegmentationProcessor(BaseProcessor):
                 return SegmentationImage(
                     asset_id=asset.asset_id, filename=asset.filename, status="not_found",
                     prompt_type="box", prompt_box=prompt, width=width, height=height,
-                    area_ratio=0, warnings=["模型没有在框选范围中生成前景，请调整目标框或补拍照片。"],
+                    area_ratio=0, warnings=["模型没有在框选范围中生成前景，请调整目标框或补拍照片。", *prediction.warnings],
                     error_id=uuid4(),
                 )
-            warnings = [TARGET_REVIEW_NOTE]
+            warnings = [TARGET_REVIEW_NOTE, *prediction.warnings]
             for previous in reversed(context.previous_results):
                 if previous.module_name != "image_quality" or previous.status not in {"success", "partial"}:
                     continue
@@ -113,7 +115,7 @@ class ObjectSegmentationProcessor(BaseProcessor):
                     or not math.isfinite(score) or not 0 <= score <= 1):
                 score = None
                 needs_review = True
-                warnings.append("模型未提供有效的掩码质量分数，请人工确认。")
+                warnings.append("服务未提供可用的质量置信分数，请人工确认；不会伪造分数。")
             elif score < MIN_REVIEW_MASK_SCORE:
                 needs_review = True
                 warnings.append("模型给出的掩码质量分数偏低，请人工确认边界。")
@@ -134,7 +136,8 @@ class ObjectSegmentationProcessor(BaseProcessor):
                 error_id = uuid4()
                 logger.exception("物体分割失败 error_id=%s asset_id=%s", error_id, asset.asset_id)
                 unavailable = isinstance(exc, SegmentationUnavailable)
-                message = (str(exc) if unavailable or isinstance(exc, image_metadata.InvalidImageError)
+                message = (str(exc) if isinstance(exc, (SegmentationUnavailable, SegmentationAPIError,
+                                                       image_metadata.InvalidImageError))
                            else "此图片分割失败，原始图片仍已保留，请根据错误编号检查日志或重新框选。")
                 raw_prompt = context.segmentation_boxes.get(asset.asset_id)
                 try:

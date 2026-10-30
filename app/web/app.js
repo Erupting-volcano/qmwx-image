@@ -53,8 +53,8 @@
       elements["upload-hint"].textContent = `${hint}手机 HEIC / HEIF 照片需先转换为 JPEG、PNG 或 WebP。`;
       if (typeof config.segmentation_enabled === "boolean") {
         elements["segmentation-config-note"].textContent = config.segmentation_enabled
-          ? "框选分割已启用：展开每张照片并拖出目标范围，再建立档案。服务端仍会检查模型依赖和权重；物体名称不会自动定位目标。"
-          : "分割当前未启用：照片与质量评估仍可正常保存。可先框选目标，但需要管理员配置并启用模型后，才会生成掩码。";
+          ? "百度云框选分割已启用：照片会通过后端发送至百度云处理，可能产生调用费用。展开每张照片并框选目标，再建立档案；物体名称不会自动定位目标。"
+          : "分割当前未启用：照片与质量评估仍可正常保存。需管理员开通百度云智能抠图并配置服务端密钥；启用后照片将发送至百度云，可能产生调用费用。";
       }
       renderFiles();
     } catch {
@@ -85,7 +85,7 @@
       details.append(createNode("p", "target-help", "当前照片无法预览，不能框选目标；服务器仍会验证照片。"));
       return details;
     }
-    details.append(createNode("p", "target-help", "在下图拖出一个矩形，包住要分割的物体。矩形只提供大致位置，最终掩码由模型生成；不会按名称自动定位。"));
+    details.append(createNode("p", "target-help", "在下图拖出一个矩形，包住要分割的物体。矩形只提供大致位置，启用后由百度云 API 返回掩码；不会按名称自动定位。"));
     const surface = createNode("div", "target-surface");
     const image = createNode("img", "target-image");
     image.src = entry.objectUrl;
@@ -108,7 +108,7 @@
       }
       status.textContent = entry.segmentationBox
         ? `已框选目标：左上 ${Math.round(entry.segmentationBox[0] * 100)}%、${Math.round(entry.segmentationBox[1] * 100)}%，右下 ${Math.round(entry.segmentationBox[2] * 100)}%、${Math.round(entry.segmentationBox[3] * 100)}%。再次拖动可重画。`
-        : "尚未框选；启用模型后，需要先框选才能分割这张图片。";
+        : "尚未框选；启用百度云分割后，需要先框选才能处理这张图片。";
       clear.disabled = !entry.segmentationBox;
     }
     function position(event) {
@@ -434,7 +434,7 @@
         item.append(createNode("p", "segmentation-metrics", `前景面积占比 ${(record.area_ratio * 100).toFixed(2)}%。`));
       }
       if (accepted && Number.isFinite(record.confidence)) {
-        item.append(createNode("p", "segmentation-metrics", `模型候选分数 ${record.confidence.toFixed(3)}；分数不是目标正确的概率。`));
+        item.append(createNode("p", "segmentation-metrics", `接口或历史模型候选分数 ${record.confidence.toFixed(3)}；分数不是目标正确的概率。`));
       }
       const warnings = accepted && Array.isArray(record.warnings) ? record.warnings.filter((value) => typeof value === "string") : [];
       if (warnings.length) {
@@ -446,7 +446,7 @@
         ? "本次分割结果不可用；原图与其他有效处理信息仍已保存。" : "本次处理没有此图片的分割结果。"));
       if (accepted && status === "needs_input") item.append(createNode("p", "quality-issues", "请在上传前展开照片，在目标四周拖出矩形，再建立档案。"));
       if (accepted && status === "disabled") item.append(createNode("p", "quality-issues", "后台未启用分割；不会生成掩码，图片采集和质量评估不受影响。"));
-      if (accepted && status === "unavailable") item.append(createNode("p", "quality-issues", "分割模型不可用，请管理员检查可选依赖、设备和本地权重配置。"));
+      if (accepted && status === "unavailable") item.append(createNode("p", "quality-issues", "分割模型不可用，请管理员检查百度云智能抠图服务开通状态、服务端密钥、网络和调用额度。"));
       if (accepted && typeof record.error_id === "string") item.append(createNode("p", "segmentation-metrics", `错误编号：${record.error_id}`));
 
       if (typeof objectId === "string" && typeof asset.asset_id === "string") {

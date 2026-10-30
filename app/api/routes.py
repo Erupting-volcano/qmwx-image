@@ -16,7 +16,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from app.config import PROJECT_ROOT, Settings
 from app.models.object_profile import ObjectProfile
-from app.models.segmentation import NormalizedBox, SegmentationData
+from app.models.segmentation import MODEL_NAME, NormalizedBox, SegmentationData
 from app.services.image_collection import CollectionError, ImageInput
 from app.storage.local_storage import CorruptProfileError, ProfileNotFoundError, resolve_mask_path, resolve_original_path
 
@@ -91,7 +91,8 @@ def public_config(request: Request) -> dict:
     return {"max_files": settings.max_files, "max_image_bytes": settings.max_image_bytes,
             "max_total_bytes": settings.max_total_bytes, "max_image_pixels": settings.max_image_pixels,
             "segmentation_enabled": settings.segmentation_enabled,
-            "segmentation_prompt_type": "box", "segmentation_model": "sam2.1_hiera_tiny"}
+            "segmentation_prompt_type": "box", "segmentation_model": MODEL_NAME,
+            "segmentation_provider": "百度智能云智能抠图"}
 
 
 def _parse_segmentation_boxes(values: list, image_count: int) -> list[NormalizedBox | None]:

@@ -21,7 +21,8 @@ def png_bytes():
 
 @pytest.fixture
 def settings(tmp_path):
-    return Settings(data_dir=tmp_path / "data")
+    return Settings(data_dir=tmp_path / "data", segmentation_enabled=False,
+                    segmentation_api_key="", segmentation_secret_key="")
 
 
 @pytest.fixture
@@ -35,7 +36,9 @@ def client_factory(tmp_path):
     clients = []
 
     def factory(*, processors=None, **overrides):
-        config = Settings(data_dir=tmp_path / f"data-{len(clients)}", **overrides)
+        config_values = {"segmentation_enabled": False, "segmentation_api_key": "", "segmentation_secret_key": ""}
+        config_values.update(overrides)
+        config = Settings(data_dir=tmp_path / f"data-{len(clients)}", **config_values)
         test_client = TestClient(create_app(config, processors=processors))
         test_client.__enter__()
         clients.append(test_client)

@@ -16,7 +16,7 @@ from app.models.segmentation import NormalizedBox, SegmentationData
 from app.modules.image_metadata import ImageMetadataProcessor
 from app.modules.image_quality import ImageQualityProcessor
 from app.modules.object_segmentation import ObjectSegmentationProcessor
-from app.modules.sam2_backend import MaskPrediction
+from app.modules.segmentation_backend import MaskPrediction
 from app.services.image_collection import CollectionError, ImageCollectionService, ImageInput
 from app.storage import local_storage
 from app.storage.local_storage import ObjectTransaction, storage_io_path
@@ -68,6 +68,7 @@ def test_default_disabled_keeps_upload_quality_and_existing_archive_shape(client
     assert result["status"] == "skipped"
     record = SegmentationData.model_validate(result["data"]).images[0]
     assert record.status == "disabled"
+    assert record.model_name == "baidu_intelligent_segmentation"
     assert record.mask_path is record.bbox is record.area_ratio is None
     assert record.warnings
     assert profile["schema_version"] == "0.1.0"
@@ -77,6 +78,7 @@ def test_default_disabled_keeps_upload_quality_and_existing_archive_shape(client
     config = client.get("/api/v1/config").json()
     assert config["segmentation_enabled"] is False
     assert config["segmentation_prompt_type"] == "box"
+    assert config["segmentation_model"] == "baidu_intelligent_segmentation"
     assert "checkpoint" not in json.dumps(config)
 
 
@@ -135,8 +137,8 @@ def test_direct_collection_revalidates_box_even_without_http(settings, png_bytes
     assert not settings.data_dir.exists()
 
 
-def test_missing_box_and_missing_weights_are_explicit_not_fake_success(settings, png_bytes):
-    enabled = replace(settings, segmentation_enabled=True)
+def test_missing_box_and_missing_credentials_are_explicit_not_fake_success(settings, png_bytes):
+    enabled = replace(settings, segmentation_enabled=True, segmentation_api_key="", segmentation_secret_key="")
     with TestClient(create_app(enabled)) as client:
         missing = post(client, png_bytes).json()["profile"]
         assert result_of(missing)["data"]["images"][0]["status"] == "needs_input"
@@ -144,7 +146,7 @@ def test_missing_box_and_missing_weights_are_explicit_not_fake_success(settings,
         record = result_of(unavailable)["data"]["images"][0]
         assert record["status"] == "unavailable"
         assert record["error_id"] and record["mask_path"] is None
-        assert "权重" in "".join(record["warnings"])
+        assert "API Key" in "".join(record["warnings"]) and "Secret Key" in "".join(record["warnings"])
         asset = unavailable["images"][0]
         assert client.get(f"/api/v1/objects/{unavailable['object_id']}/images/{asset['asset_id']}/mask").status_code == 404
 
@@ -288,7 +290,50 @@ def test_original_preview_rejects_cross_resource_paths_even_when_the_file_exists
     assert response.json()["detail"]["code"] == "image_not_found"
 
 
-@pytest.mark.parametrize("name,value", [("segmentation_enabled", 1), ("segmentation_device", "auto")])
+@pytest.mark.parametrize("name,value", [
+    ("segmentation_enabled", 1), ("segmentation_timeout_seconds", 0),
+    ("segmentation_timeout_seconds", 121), ("segmentation_timeout_seconds", float("nan")),
+    ("segmentation_timeout_seconds", True), ("segmentation_api_key", "bad\nkey"),
+    ("segmentation_secret_key", 123),
+])
 def test_segmentation_configuration_rejects_ambiguous_values(tmp_path, name, value):
     with pytest.raises(ValueError):
         Settings(data_dir=tmp_path, **{name: value})
+
+
+def test_api_credentials_are_absent_from_repr_public_config_archive_and_logs(settings, png_bytes, caplog):
+    api_key, secret_key = "UNIT_API_KEY_DO_NOT_EXPOSE", "UNIT_SECRET_DO_NOT_EXPOSE"
+    settings = replace(settings, segmentation_enabled=False,
+                       segmentation_api_key=api_key, segmentation_secret_key=secret_key)
+    assert api_key not in repr(settings) and secret_key not in repr(settings)
+    with TestClient(create_app(settings)) as client:
+        config = client.get("/api/v1/config")
+        created = post(client, png_bytes)
+        assert created.status_code == 201, created.text
+        profile = created.json()["profile"]
+        archive = storage_io_path(settings.data_dir / "objects" / profile["object_id"] / "profile.json").read_text(encoding="utf-8")
+        for output in (config.text, created.text, archive, caplog.text):
+            assert api_key not in output and secret_key not in output
+        assert "api_key" not in config.text and "secret_key" not in config.text
+
+
+def test_legacy_sam2_archive_remains_previewable_while_new_records_identify_cloud_backend(settings, png_bytes):
+    client, settings = configured_client(settings, TestOnlyBackend())
+    with client:
+        profile = post(client, png_bytes, boxes=[[0, 0, 1, 1]]).json()["profile"]
+        current_record = result_of(profile)["data"]["images"][0]
+        assert current_record["model_name"] == "baidu_intelligent_segmentation"
+        current_record["model_name"] = "sam2.1_hiera_tiny"
+        archive = storage_io_path(settings.data_dir / "objects" / profile["object_id"] / "profile.json")
+        archive.write_text(json.dumps(profile), encoding="utf-8")
+        old_bytes = archive.read_bytes()
+        fetched = client.get(f"/api/v1/objects/{profile['object_id']}")
+        assert fetched.status_code == 200
+        assert result_of(fetched.json())["data"]["images"][0]["model_name"] == "sam2.1_hiera_tiny"
+        base = f"/api/v1/objects/{profile['object_id']}/images/{current_record['asset_id']}"
+        preview = client.get(base + "/mask")
+        assert preview.status_code == 200
+        assert preview.content == storage_io_path(settings.data_dir / current_record["mask_path"]).read_bytes()
+        assert archive.read_bytes() == old_bytes
+        new_profile = post(client, png_bytes, boxes=[[0, 0, 1, 1]]).json()["profile"]
+        assert result_of(new_profile)["data"]["images"][0]["model_name"] == "baidu_intelligent_segmentation"

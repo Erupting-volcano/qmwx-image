@@ -1,12 +1,8 @@
-"""Mask contract tests use injected predictions; real SAM2 smoke is opt-in."""
+"""Mask contracts use injected predictions; paid cloud inference is opt-in."""
 
-from contextlib import nullcontext
 from dataclasses import replace
 from io import BytesIO
 import os
-from pathlib import Path
-import sys
-from types import ModuleType, SimpleNamespace
 from uuid import uuid4
 
 from PIL import Image, ImageDraw
@@ -18,10 +14,12 @@ from app.models.image_asset import ImageAsset
 from app.models.image_quality import ImageQuality, ImageQualityData
 from app.models.processing_result import ProcessingResult
 from app.models.segmentation import NormalizedBox, SegmentationData, SegmentationImage
-from app.modules import image_metadata, sam2_backend
+from app.modules import image_metadata
 from app.modules.base import ProcessingContext
+from app.modules.baidu_backend import BaiduSegmentationBackend
 from app.modules.object_segmentation import ObjectSegmentationProcessor
-from app.modules.sam2_backend import MaskPrediction, Sam2Backend, SegmentationUnavailable
+from app.modules.segmentation_backend import MaskPrediction, SegmentationAPIError, SegmentationUnavailable
+from app.storage.local_storage import storage_io_path
 
 
 BOX = NormalizedBox(x0=0.25, y0=0.25, x1=0.75, y1=0.75)
@@ -46,8 +44,8 @@ class RecordingStore:
     def save_mask(self, asset_id, mask):
         path = f"objects/{self.object_id}/masks/{asset_id}_{uuid4()}.png"
         destination = self.root / path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        mask.save(destination, format="PNG")
+        storage_io_path(destination.parent).mkdir(parents=True, exist_ok=True)
+        mask.save(storage_io_path(destination), format="PNG")
         self.paths.append(path)
         return path
 
@@ -61,7 +59,7 @@ class PredictingBackend:
         if self.outcome == "error" or (self.outcome == "second_error" and len(self.calls) == 2):
             raise RuntimeError("PRIVATE_MODEL_PATH_C:\\private\\weights")
         if self.outcome == "unavailable":
-            raise SegmentationUnavailable("分割模型无法加载，请检查可选依赖。")
+            raise SegmentationUnavailable("云端分割服务不可用，请检查服务开通状态。")
         mask = Image.new("L", image.size, 255 if self.outcome == "full" else 0)
         if self.outcome not in {"empty", "full"}:
             x0, y0, x1, y1 = box
@@ -81,8 +79,8 @@ def make_context(tmp_path, contents=None, *, boxes=True, max_pixels=40_000_000):
         asset_id = uuid4()
         relative = f"objects/{object_id}/images/{asset_id}.png"
         path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
+        storage_io_path(path.parent).mkdir(parents=True, exist_ok=True)
+        storage_io_path(path).write_bytes(content)
         # Deliberately inaccurate hints cannot stand in for actual image checks.
         assets.append(ImageAsset(
             asset_id=asset_id, filename="same.png", storage_path=relative, width=1, height=1,
@@ -119,9 +117,9 @@ def test_normal_prediction_records_real_mask_bbox_area_and_asset_id(tmp_path):
     assert item.area_ratio == pytest.approx(0.25)
     assert item.confidence == pytest.approx(0.95)
     assert backend.calls == [((32, 24), (8.0, 6.0, 24.0, 18.0))]
-    assert "正确率" in item.warnings[0]
+    assert "人工核对" in item.warnings[0] and "目标" in item.warnings[0]
     assert "mask" not in result.data  # No pixel arrays are embedded in JSON.
-    with Image.open(tmp_path / item.mask_path) as saved:
+    with Image.open(storage_io_path(tmp_path / item.mask_path)) as saved:
         assert saved.mode == "L" and saved.size == (32, 24)
         assert {index for index, count in enumerate(saved.histogram()) if count} == {0, 255}
         assert saved.getbbox() == item.bbox
@@ -137,6 +135,27 @@ def test_empty_prediction_is_not_found_without_a_fake_mask(tmp_path):
     assert data.images[0].status == "not_found"
     assert data.images[0].mask_path is None and data.images[0].area_ratio == 0
     assert data.images[0].error_id
+    assert context.artifact_store.paths == []
+
+
+def test_empty_prediction_retains_provider_coordinate_mapping_warning(tmp_path):
+    mapping_warning = "云端掩码已缩放回原图坐标，请复查边界。"
+
+    class EmptyCloudBackend(PredictingBackend):
+        def predict(self, image, box):
+            prediction = super().predict(image, box)
+            return MaskPrediction(prediction.mask, None, warnings=(mapping_warning,))
+
+    context = make_context(tmp_path)
+    result = processor(tmp_path, EmptyCloudBackend("empty")).process(context)
+    data = parsed(result)
+    item = data.images[0]
+    assert result.status == "failed" and data.failed_count == 1
+    assert item.status == "not_found" and item.area_ratio == 0
+    assert item.mask_path is None and item.error_id == result.errors[0].error_id
+    assert "没有" in item.warnings[0]
+    assert mapping_warning in item.warnings
+    assert any(mapping_warning in warning for warning in result.warnings)
     assert context.artifact_store.paths == []
 
 
@@ -164,6 +183,28 @@ def test_invalid_backend_output_is_isolated_with_safe_errors(tmp_path, outcome):
     assert context.artifact_store.paths == []
 
 
+def test_safe_api_failure_explanation_is_visible_in_warnings_and_errors(tmp_path):
+    safe_message = "百度分割API请求过于频繁，请检查额度后稍后重试；本次未自动重试。"
+
+    class RateLimitedBackend:
+        def predict(self, image, box):
+            raise SegmentationAPIError(safe_message)
+
+    context = make_context(tmp_path)
+    result = processor(tmp_path, RateLimitedBackend()).process(context)
+    data = parsed(result)
+    item = data.images[0]
+    assert result.status == "failed" and data.failed_count == 1
+    assert item.status == "failed" and item.mask_path is None
+    assert item.warnings == [safe_message]
+    assert any(safe_message in warning for warning in result.warnings)
+    assert result.errors[0].message == safe_message
+    assert result.errors[0].code == "segmentation_failed"
+    assert result.errors[0].error_id == item.error_id
+    assert result.errors[0].asset_id == context.images[0].asset_id
+    assert context.artifact_store.paths == []
+
+
 def test_second_image_failure_keeps_first_mask_and_distinct_resource_ids(tmp_path):
     context = make_context(tmp_path, [image_bytes(), image_bytes()])
     result = processor(tmp_path, PredictingBackend("second_error")).process(context)
@@ -177,7 +218,7 @@ def test_second_image_failure_keeps_first_mask_and_distinct_resource_ids(tmp_pat
 
 def test_disabled_or_missing_box_does_not_call_the_model(tmp_path):
     backend = PredictingBackend("error")
-    disabled = ObjectSegmentationProcessor(Settings(data_dir=tmp_path), backend=backend)
+    disabled = ObjectSegmentationProcessor(Settings(data_dir=tmp_path, segmentation_enabled=False), backend=backend)
     result = disabled.process(make_context(tmp_path))
     assert result.status == "skipped"
     assert parsed(result).images[0].status == "disabled"
@@ -187,13 +228,15 @@ def test_disabled_or_missing_box_does_not_call_the_model(tmp_path):
     assert backend.calls == []
 
 
-def test_missing_checkpoint_and_dependency_or_load_failure_are_unavailable(tmp_path):
+def test_missing_credentials_and_api_unavailability_are_explicit(tmp_path):
     context = make_context(tmp_path)
-    missing = ObjectSegmentationProcessor(Settings(data_dir=tmp_path, segmentation_enabled=True))
+    missing = ObjectSegmentationProcessor(Settings(
+        data_dir=tmp_path, segmentation_enabled=True, segmentation_api_key="", segmentation_secret_key="",
+    ))
     result = missing.process(context)
     assert result.status == "skipped"
     assert parsed(result).images[0].status == "unavailable"
-    assert "权重" in result.errors[0].message
+    assert "API Key" in result.errors[0].message and "Secret Key" in result.errors[0].message
     result = processor(tmp_path, PredictingBackend("unavailable")).process(context)
     assert parsed(result).skipped_count == 1
     assert parsed(result).images[0].mask_path is None
@@ -262,7 +305,7 @@ def test_exif_rotation_converts_normalized_box_to_the_actual_model_frame(tmp_pat
     assert (image.width, image.height) == (8, 12)
     assert backend.calls == [((8, 12), (2.0, 3.0, 6.0, 9.0))]
     assert image.bbox == (2, 3, 6, 9)
-    with Image.open(tmp_path / image.mask_path) as mask:
+    with Image.open(storage_io_path(tmp_path / image.mask_path)) as mask:
         assert mask.size == (8, 12)
 
 
@@ -341,113 +384,73 @@ def test_empty_batch_is_a_valid_skipped_result(tmp_path):
     assert parsed(result).input_count == 0
 
 
-def test_backend_constructor_is_lazy_and_missing_weights_do_not_import_optional_packages(tmp_path, monkeypatch):
-    import builtins
+def test_api_constructor_is_lazy_and_missing_credentials_never_open_network(tmp_path, monkeypatch):
+    import urllib.request
 
-    original_import = builtins.__import__
-    imported = []
-
-    def guarded_import(name, *args, **kwargs):
-        if name.split(".")[0] in {"torch", "numpy", "sam2"}:
-            imported.append(name)
-            raise AssertionError("optional imports must remain lazy")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
-    backend = Sam2Backend(tmp_path / "missing.pt")
-    with pytest.raises(SegmentationUnavailable, match="权重"):
-        backend.predict(Image.new("RGB", (8, 8)), (1, 1, 7, 7))
-    assert imported == []
-
-
-def test_backend_loads_official_api_once_and_disables_optional_cuda_postprocessing(tmp_path, monkeypatch):
-    checkpoint = tmp_path / "sam2.1_hiera_tiny.pt"
-    checkpoint.write_bytes(b"unit test does not contain model weights")
-    calls = []
-    torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False), inference_mode=nullcontext)
-    monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setitem(sys.modules, "numpy", SimpleNamespace())
-    build_module, predictor_module = ModuleType("sam2.build_sam"), ModuleType("sam2.sam2_image_predictor")
-
-    def build(config, path, **kwargs):
-        calls.append((config, path, kwargs))
-        return object()
-
-    class Predictor:
-        def __init__(self, model, **kwargs):
-            self.kwargs = kwargs
-
-    build_module.build_sam2 = build
-    predictor_module.SAM2ImagePredictor = Predictor
-    monkeypatch.setitem(sys.modules, "sam2", ModuleType("sam2"))
-    monkeypatch.setitem(sys.modules, "sam2.build_sam", build_module)
-    monkeypatch.setitem(sys.modules, "sam2.sam2_image_predictor", predictor_module)
-    backend = Sam2Backend(checkpoint)
-    first = backend._load()
-    assert backend._load() is first
-    assert len(calls) == 1
-    assert calls[0] == ("configs/sam2.1/sam2.1_hiera_t.yaml", str(checkpoint), {"device": "cpu", "apply_postprocessing": False})
-    assert first.kwargs == {"max_hole_area": 0, "max_sprinkle_area": 0}
-    with pytest.raises(SegmentationUnavailable, match="CUDA"):
-        Sam2Backend(checkpoint, "cuda")._load()
-
-
-def test_dependency_import_failure_is_safe_and_cached_until_restart(tmp_path, monkeypatch):
-    import builtins
-
-    checkpoint = tmp_path / "weights.pt"
-    checkpoint.write_bytes(b"not a real checkpoint")
-    real_import = builtins.__import__
-    attempted = []
-
-    def missing_numpy(name, *args, **kwargs):
-        if name == "numpy":
-            attempted.append(name)
-            raise ModuleNotFoundError("PRIVATE_PACKAGE_PATH_C:\\private\\numpy")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", missing_numpy)
-    backend = Sam2Backend(checkpoint)
-    for _ in range(2):
-        with pytest.raises(SegmentationUnavailable) as error:
-            backend._load()
-        assert "PRIVATE_PACKAGE_PATH" not in str(error.value)
-        assert "可选依赖" in str(error.value)
-    assert attempted == ["numpy"]
-
-
-def test_checkpoint_builder_failure_is_safe_and_not_reinitialized_per_image(tmp_path, monkeypatch):
-    checkpoint = tmp_path / "weights.pt"
-    checkpoint.write_bytes(b"not a real checkpoint")
-    monkeypatch.setitem(sys.modules, "numpy", SimpleNamespace())
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
-    build_module, predictor_module = ModuleType("sam2.build_sam"), ModuleType("sam2.sam2_image_predictor")
     calls = []
 
-    def fail(*args, **kwargs):
+    def denied_open(*args, **kwargs):
         calls.append(True)
-        raise RuntimeError("PRIVATE_WEIGHT_PATH_C:\\private\\weights")
+        raise AssertionError("Unit tests must never make a cloud request")
 
-    build_module.build_sam2 = fail
-    predictor_module.SAM2ImagePredictor = object
-    monkeypatch.setitem(sys.modules, "sam2", ModuleType("sam2"))
-    monkeypatch.setitem(sys.modules, "sam2.build_sam", build_module)
-    monkeypatch.setitem(sys.modules, "sam2.sam2_image_predictor", predictor_module)
-    backend = Sam2Backend(checkpoint)
-    for _ in range(2):
-        with pytest.raises(SegmentationUnavailable) as error:
-            backend._load()
-        assert "PRIVATE_WEIGHT_PATH" not in str(error.value)
-        assert "模型加载失败" in str(error.value)
-    assert len(calls) == 1
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", denied_open)
+    backend = BaiduSegmentationBackend("", "")
+    with Image.new("RGB", (128, 128)) as image:
+        with pytest.raises(SegmentationUnavailable, match="API Key"):
+            backend.predict(image, (16, 16, 112, 112))
+    assert calls == []
 
 
-@pytest.mark.skipif(os.environ.get("DIGITIZER_RUN_SAM2_SMOKE") != "1", reason="Real SAM2 inference needs explicit opt-in, optional dependencies and a local checkpoint")
-def test_real_sam2_checkpoint_smoke_without_any_automatic_download():
+def test_default_processor_uses_cloud_backend_without_requests_at_initialization(tmp_path, monkeypatch):
+    import urllib.request
+
+    def denied_open(*args, **kwargs):
+        raise AssertionError("Creating or disabling the processor must not call the service")
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", denied_open)
+    configured = Settings(
+        data_dir=tmp_path, segmentation_enabled=True,
+        segmentation_api_key="unit-api-key", segmentation_secret_key="unit-secret-key",
+    )
+    current = ObjectSegmentationProcessor(configured)
+    assert isinstance(current.backend, BaiduSegmentationBackend)
+    assert parsed(current.process(make_context(tmp_path, boxes=False))).images[0].status == "needs_input"
+
+
+def test_provider_processing_notes_are_retained_without_fabricating_confidence(tmp_path):
+    class CloudLikePrediction(PredictingBackend):
+        def predict(self, image, box):
+            prediction = super().predict(image, box)
+            return MaskPrediction(prediction.mask, None, warnings=("云端分析经过缩放，边界需要人工复查。",))
+
+    result = processor(tmp_path, CloudLikePrediction()).process(make_context(tmp_path))
+    item = parsed(result).images[0]
+    assert item.model_name == "baidu_intelligent_segmentation"
+    assert item.status == "needs_confirmation"
+    assert item.confidence is None
+    assert "云端分析经过缩放，边界需要人工复查。" in item.warnings
+    assert item.mask_path
+
+
+@pytest.mark.parametrize("model_name", ["baidu_intelligent_segmentation", "sam2.1_hiera_tiny"])
+def test_current_cloud_and_legacy_local_model_identifiers_remain_readable(model_name):
+    record = SegmentationImage.model_validate({**valid_record(), "model_name": model_name})
+    assert record.model_name == model_name
+
+
+@pytest.mark.skipif(
+    os.environ.get("DIGITIZER_RUN_SEGMENTATION_API_SMOKE") != "1",
+    reason="Explicit opt-in required: uploads a synthetic image to Baidu and may incur API charges",
+)
+def test_real_segmentation_api_smoke_requires_explicit_opt_in():
     settings = Settings()
-    with Image.new("RGB", (128, 96), "white") as image:
-        ImageDraw.Draw(image).ellipse((32, 24, 95, 71), fill="blue")
-        prediction = Sam2Backend(settings.segmentation_checkpoint, settings.segmentation_device).predict(image, (24, 16, 104, 80))
+    backend = BaiduSegmentationBackend(
+        settings.segmentation_api_key, settings.segmentation_secret_key, settings.segmentation_timeout_seconds,
+    )
+    with Image.new("RGB", (256, 192), "white") as image:
+        ImageDraw.Draw(image).ellipse((64, 48, 191, 143), fill="blue")
+        prediction = backend.predict(image, (32, 24, 224, 168))
     with prediction.mask as mask:
-        assert mask.mode == "L" and mask.size == (128, 96)
+        assert mask.mode == "L" and mask.size == (256, 192)
         assert {index for index, count in enumerate(mask.histogram()) if count}.issubset({0, 255})
+    assert prediction.score is None

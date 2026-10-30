@@ -1,4 +1,4 @@
-"""Typed SAM 2 box prompts and per-image, transaction-backed mask records."""
+"""Typed box prompts and API segmentation records, including legacy local masks."""
 
 from typing import Annotated, Literal
 from uuid import UUID
@@ -8,7 +8,8 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 from app.models._common import ContractModel, safe_relative_path
 
 
-MODEL_NAME = "sam2.1_hiera_tiny"
+MODEL_NAME = "baidu_intelligent_segmentation"
+SegmentationModel = Literal["baidu_intelligent_segmentation", "sam2.1_hiera_tiny"]
 PixelCoordinate = Annotated[int, Field(ge=0, strict=True)]
 SegmentationStatus = Literal[
     "success", "needs_confirmation", "not_found", "failed", "disabled", "unavailable", "needs_input",
@@ -42,7 +43,7 @@ class SegmentationImage(ContractModel):
     asset_id: UUID
     filename: str = Field(min_length=1, max_length=512)
     status: SegmentationStatus
-    model_name: Literal[MODEL_NAME] = MODEL_NAME
+    model_name: SegmentationModel = MODEL_NAME
     prompt_type: Literal["box", "none"] = "none"
     prompt_box: NormalizedBox | None = None
     width: int | None = Field(default=None, gt=0, strict=True)
@@ -55,7 +56,7 @@ class SegmentationImage(ContractModel):
     area_ratio: float | None = Field(default=None, ge=0, le=1)
     confidence: float | None = Field(
         default=None, ge=0, le=1,
-        description="SAM predicted mask quality; not probability of target identity or correctness.",
+        description="Provider quality score when supplied; not target identity probability. Baidu returns no verified score.",
     )
     warnings: list[str] = Field(default_factory=list)
     error_id: UUID | None = None

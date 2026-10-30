@@ -14,6 +14,7 @@ from app.modules.base import BaseProcessor
 from app.modules.image_metadata import ImageMetadataProcessor, InspectedImage, InvalidImageError
 from app.modules.image_quality import ImageQualityProcessor
 from app.modules.object_segmentation import ObjectSegmentationProcessor
+from app.modules.object_understanding_processor import ObjectUnderstandingProcessor
 from app.services.pipeline import Pipeline
 from app.storage.local_storage import LocalStorage
 
@@ -61,6 +62,7 @@ class ImageCollectionService:
         self.storage = storage or LocalStorage(self.settings.data_dir)
         self.pipeline = pipeline or Pipeline(
             [ImageMetadataProcessor(), ImageQualityProcessor(), ObjectSegmentationProcessor(self.settings)]
+            + ([ObjectUnderstandingProcessor(self.settings)] if self.settings.recognition_enabled else [])
             if processors is None else processors
         )
 

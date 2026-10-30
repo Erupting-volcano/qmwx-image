@@ -6,7 +6,7 @@ from contextlib import ExitStack
 from threading import Lock
 from uuid import uuid4
 
-from PIL import Image, ImageOps
+from PIL import Image
 
 from app.config import Settings
 from app.models.image_asset import ImageAsset
@@ -15,6 +15,7 @@ from app.models.segmentation import NormalizedBox, SegmentationCandidate, Segmen
 from app.models.processing_result import ProcessingError, ProcessingResult
 from app.modules import image_metadata
 from app.modules.base import BaseProcessor, ProcessingContext
+from app.modules.image_input import load_verified_rgb
 from app.modules.segmentation_backend import (
     BoxPrompt, MaskPrediction, SegmentationAPIError, SegmentationRequest,
     SegmentationUnavailable, check_request_capabilities,
@@ -85,31 +86,7 @@ class ObjectSegmentationProcessor(BaseProcessor):
             return None, None
         return float(score), score_type
 
-    @staticmethod
-    def _load_rgb(context: ProcessingContext, asset: ImageAsset) -> Image.Image:
-        path = context.resolve_asset(asset)
-        inspection = context.inspected_images.get(asset.asset_id)
-        metadata = (
-            inspection.metadata_if_unchanged(path, context.max_image_pixels)
-            if type(inspection) is image_metadata.InspectedImage else None
-        )
-        if metadata is None:
-            metadata = image_metadata.inspect_image(path, context.max_image_pixels)
-        with Image.open(path) as image:
-            if image.format != metadata["image_format"] or image.size != (metadata["width"], metadata["height"]):
-                raise image_metadata.InvalidImageError("图片内容在验证后发生变化")
-            integer_grayscale = image.mode in {"I;16", "I;16L", "I;16B", "I"}
-            if integer_grayscale and "transparency" in image.info:
-                raise image_metadata.InvalidImageError("分割暂不支持带透明色的16位灰度图片，请转换为8位PNG或JPEG。")
-            ImageOps.exif_transpose(image, in_place=True)
-            if integer_grayscale:
-                with image.point(lambda value: value * (255 / 65535)) as scaled:
-                    return scaled.convert("RGB")
-            if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
-                with image.convert("RGBA") as rgba, Image.new("RGBA", image.size, "white") as background:
-                    background.alpha_composite(rgba)
-                    return background.convert("RGB")
-            return image.convert("RGB")
+    _load_rgb = staticmethod(load_verified_rgb)
 
     def _segment_asset(self, context: ProcessingContext, asset: ImageAsset) -> SegmentationImage:
         prompt = context.segmentation_boxes.get(asset.asset_id)

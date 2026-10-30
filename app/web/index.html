@@ -30,7 +30,7 @@
             <span class="note-symbol" aria-hidden="true">i</span>
             <div>
               <h2 id="scope-title">当前模块的处理范围</h2>
-              <p>当前提取基础信息、筛查图像质量，并通过统一分割框架调用可用后端。当前仅百度云 API 具备实际推理能力，页面需人工框选；物体类别、真实尺寸、材质与 3D 模型仍为未知。</p>
+              <p>当前提取基础信息、筛查图像质量，并支持可选的分割和视觉语言模型观察。AI 类别、材料和部件需保留依据与不确定性；真实尺寸和 3D 模型仍待独立测量与重建。</p>
             </div>
           </aside>
         </section>
@@ -59,6 +59,7 @@
               </div>
               <p id="upload-hint" class="field-hint upload-hint">最多 20 张，合计不超过 100 MiB。手机 HEIC / HEIF 照片需先转换为 JPEG、PNG 或 WebP。</p>
               <p id="segmentation-config-note" class="segmentation-config-note">可选：选图后展开每张照片并框选目标。分割默认关闭，当前仅百度后端已实现；启用百度分割后照片会发送至百度云，可能产生调用费用。物体名称不会自动定位目标，未启用时仍可建立基础档案。</p>
+              <p id="recognition-config-note" class="segmentation-config-note">物体理解默认关闭。启用后，照片及已校验的观察信息会发送至服务端配置的模型服务商，可能产生费用；材料仅为候选，不作为测量或用户确认结果。</p>
 
               <div id="file-list" class="file-list" aria-label="已选择的图片"></div>
               <div id="selection-actions" class="selection-actions" hidden><button id="clear-files" type="button" class="text-button">清空已选照片</button><p>可继续添加其他视角的照片</p></div>
@@ -66,7 +67,7 @@
 
             <div id="form-error" class="message message-error" role="alert" hidden></div>
             <div class="form-footer">
-              <p class="privacy-note"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 2 4 4.5V9c0 4 6 8 6 8s6-4 6-8V4.5L10 2Z" stroke="currentColor" stroke-width="1.3"/><path d="m7 9 2 2 4-4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>原图与档案保存在服务端；启用分割后照片还会发送至百度云</p>
+              <p class="privacy-note"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 2 4 4.5V9c0 4 6 8 6 8s6-4 6-8V4.5L10 2Z" stroke="currentColor" stroke-width="1.3"/><path d="m7 9 2 2 4-4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>原图与档案保存在服务端；启用云端分割或物体理解后还会发送至对应服务商</p>
               <button id="submit-button" class="primary-button" type="submit"><span id="submit-label">建立数字档案</span><span id="submit-arrow" aria-hidden="true">↗</span><span id="submit-spinner" class="spinner" hidden aria-hidden="true"></span></button>
             </div>
             <p id="upload-status" class="upload-status" role="status" aria-live="polite"></p>
@@ -91,6 +92,12 @@
               <p id="segmentation-summary" class="quality-summary"></p>
               <p class="quality-note">目标由上传前的人工矩形框指定，掩码由所记录的分割后端生成。请核对目标和边界；百度不提供可靠质量分数，不同模型的分数不能直接比较，分割也不提供真实尺寸。SAM 2.1 当前仅预留接口，历史模型记录仍可读取。</p>
               <ul id="segmentation-images" class="segmentation-images"></ul>
+            </section>
+            <section class="quality-section" aria-labelledby="understanding-title">
+              <h4 id="understanding-title">物体理解与来源</h4>
+              <p id="understanding-summary" class="quality-summary"></p>
+              <p class="quality-note">以下区分可见观察与 AI 候选。材料候选和模型自评分不能证明真实材质；多视角融合只整合语义，不提供相机姿态、尺寸或三维结构。</p>
+              <ul id="understanding-results" class="quality-images"></ul>
             </section>
             <section id="warnings-section" class="warnings-section" hidden><h4>处理提示</h4><ul id="warnings-list"></ul></section>
             <details class="json-details"><summary>查看完整档案 JSON <span>结构化原始记录</span></summary><pre id="profile-json" tabindex="0" aria-label="完整档案 JSON"></pre></details>

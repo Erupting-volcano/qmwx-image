@@ -65,6 +65,8 @@ class Pipeline:
                 result = ProcessingResult.model_validate(result.model_dump())
                 if result.module_name != processor.name:
                     raise ValueError("模块结果名称与注册名称不一致")
+                if result.module_name == "object_understanding" and result.data:
+                    self.assembler.validate_understanding(current, result)
                 if result.module_name == "object_segmentation":
                     from app.models.segmentation import SegmentationData
 

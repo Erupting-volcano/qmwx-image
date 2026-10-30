@@ -12,6 +12,7 @@
     "profile-facts", "result-images", "missing-information", "warnings-section",
     "warnings-list", "profile-json", "view-json", "download-json", "drop-description", "upload-hint",
     "quality-summary", "quality-images", "segmentation-config-note", "segmentation-summary", "segmentation-images",
+    "recognition-config-note", "understanding-summary", "understanding-results",
   ].map((id) => [id, document.getElementById(id)]));
 
   let selectedFiles = [];
@@ -66,6 +67,14 @@
           note = `当前选择：${provider}。本页面提交人工矩形框提示；仅所选后端声明且已实现的能力才能执行，物体名称不会自动定位目标。`;
         }
         elements["segmentation-config-note"].textContent = note;
+      }
+      if (typeof config.recognition_enabled === "boolean") {
+        const model = typeof config.recognition_model === "string" ? config.recognition_model : "已配置模型";
+        const limit = Number.isSafeInteger(config.recognition_max_images) && config.recognition_max_images > 0
+          ? `每批最多分析 ${config.recognition_max_images} 张，超出部分仍可上传保存。` : "";
+        elements["recognition-config-note"].textContent = config.recognition_enabled
+          ? `物体理解已启用（${model}）：照片及已校验的观察信息会发送至服务端配置的模型服务商，可能产生费用。${limit}AI 材料和类别保留为候选，请核对来源与依据。`
+          : "物体理解当前未启用，图片采集、质量评估及独立配置的分割仍可使用。启用后照片和观察信息将发送至模型服务商，可能产生费用。";
       }
       renderFiles();
     } catch {
@@ -498,6 +507,93 @@
     if (!images.length) elements["segmentation-images"].append(createNode("li", "quality-note", "暂无可分割的图片记录。"));
   }
 
+  function renderUnderstanding(profile, images) {
+    const results = Array.isArray(profile.processing_results) ? profile.processing_results : [];
+    const result = results.filter((entry) => entry?.module_name === "object_understanding").at(-1);
+    const accepted = ["success", "partial"].includes(result?.status);
+    const data = accepted && result.data && typeof result.data === "object" ? result.data : {};
+    const assets = new Map(images.filter((asset) => typeof asset?.asset_id === "string").map((asset) => [asset.asset_id, asset]));
+    const list = elements["understanding-results"];
+    list.replaceChildren();
+    const knownFact = (fact) => fact && Array.isArray(fact.asset_ids) && fact.asset_ids.length > 0
+      && fact.asset_ids.every((id) => typeof id === "string" && assets.has(id));
+    const source = (fact) => fact.asset_ids.map((id) => `${assets.get(id).filename || "未命名图片"} [${id}]`).join("；");
+    function addFacts(parent, title, facts, describe = (fact) => fact.text) {
+      const known = Array.isArray(facts) ? facts.filter(knownFact) : [];
+      if (!known.length) return;
+      parent.append(createNode("h5", "quality-image-name", title));
+      const items = createNode("ul", "quality-suggestions");
+      known.forEach((fact) => {
+        const text = describe(fact);
+        if (typeof text !== "string") return;
+        const label = fact.status === "observed" ? "观察" : "候选";
+        const item = createNode("li", "", `${label}：${text}`);
+        if (typeof fact.evidence === "string") item.append(createNode("p", "quality-note", `依据：${fact.evidence}`));
+        item.append(createNode("p", "quality-note", `来源：${source(fact)}`));
+        items.append(item);
+      });
+      parent.append(items);
+    }
+    const observations = Array.isArray(data.image_observations)
+      ? data.image_observations.filter((item) => assets.has(item?.asset_id)) : [];
+    const states = new Map((Array.isArray(data.image_states) ? data.image_states : [])
+      .filter((item) => assets.has(item?.asset_id)).map((item) => [item.asset_id, item]));
+    elements["understanding-summary"].textContent = accepted
+      ? `已保留 ${observations.length} / ${images.length} 张图片的有效观察。${data.fusion_status === "failed" ? "多视角融合未完成，单图结果仍然保留。" : data.fusion_status === "success" ? "多视角语义融合已完成，请核对共同信息和冲突。" : "当前没有完成多视角融合；单图观察不等于多视角共同结论。"}`
+      : result ? "本次物体理解未完成或未启用；原始图片、质量评估及其他有效处理结果仍已保留。" : "本份档案未执行物体理解，暂无模型观察结果。";
+    if (accepted) {
+      const summary = createNode("li", "quality-image");
+      addFacts(summary, "综合类别候选", data.object_category ? [data.object_category] : data.category_candidates,
+        (fact) => fact.category);
+      addFacts(summary, "综合外观", data.appearance_summary);
+      addFacts(summary, "材料候选（未经材质验证）", data.material_candidates, (fact) => fact.material_name);
+      addFacts(summary, "可见部件", data.components, (fact) => `${fact.component_name}：${fact.description || ""}`);
+      addFacts(summary, "多视角共同支持", data.cross_view_consensus);
+      const conflicts = Array.isArray(data.conflicting_observations) ? data.conflicting_observations : [];
+      conflicts.forEach((conflict) => {
+        if (!Array.isArray(conflict?.claims) || conflict.claims.length < 2 || !conflict.claims.every(knownFact)) return;
+        summary.append(createNode("h5", "quality-image-name", `待核对冲突：${typeof conflict.field === "string" ? conflict.field : "不同观察"}`));
+        if (typeof conflict.description === "string") summary.append(createNode("p", "quality-note", conflict.description));
+        addFacts(summary, "分别记录的说法", conflict.claims);
+      });
+      if (Array.isArray(data.unknown_information) && data.unknown_information.length) {
+        summary.append(createNode("h5", "quality-image-name", "仍无法确定的信息"));
+        const unknown = createNode("ul", "quality-suggestions");
+        data.unknown_information.filter((value) => typeof value === "string").forEach((value) => unknown.append(createNode("li", "", value)));
+        summary.append(unknown);
+      }
+      if (summary.children.length) list.append(summary);
+    }
+    const labels = { success: "观察已完成", partial: "部分任务完成", failed: "观察失败", disabled: "未启用",
+      unavailable: "模型不可用", limit_exceeded: "超出本批分析数量" };
+    images.forEach((asset) => {
+      const state = accepted ? states.get(asset.asset_id) : null;
+      const observation = observations.find((item) => item.asset_id === asset.asset_id);
+      const item = createNode("li", "quality-image");
+      item.append(createNode("h5", "quality-image-name", asset.filename || "未命名图片"));
+      item.append(createNode("p", "quality-note", labels[state?.status] || (observation ? "已保留观察" : "未取得有效观察")));
+      if (typeof state?.message === "string" && state.message) item.append(createNode("p", "quality-issues", state.message));
+      if (observation) {
+        addFacts(item, "名称与类别候选", [observation.object_name, ...(Array.isArray(observation.category_candidates) ? observation.category_candidates : [])],
+          (fact) => fact.text || fact.category);
+        addFacts(item, "可能用途", observation.possible_uses);
+        addFacts(item, "颜色与分布", observation.appearance?.colors);
+        addFacts(item, "形状与表面", [observation.appearance?.shape_description, observation.appearance?.surface_description]);
+        addFacts(item, "可见结构", observation.appearance?.visible_features);
+        addFacts(item, "材料候选", observation.material_candidates, (fact) => fact.material_name);
+        addFacts(item, "可见部件", observation.visible_components, (fact) => `${fact.component_name}：${fact.description || ""}`);
+        const viewpoint = observation.viewpoint;
+        if (knownFact(viewpoint)) addFacts(item, "语义视角（不是相机姿态）", [viewpoint], (fact) => fact.viewpoint);
+        addFacts(item, "其他可见观察", observation.observations);
+        const notes = [...(Array.isArray(observation.unknown_information) ? observation.unknown_information : []),
+          ...(Array.isArray(observation.warnings) ? observation.warnings : [])].filter((value) => typeof value === "string");
+        notes.forEach((note) => item.append(createNode("p", "quality-note", note)));
+      }
+      list.append(item);
+    });
+    if (!images.length) list.append(createNode("li", "quality-note", "暂无图片可供理解。"));
+  }
+
   function renderResult(payload) {
     const profile = payload.profile;
     const objectId = payload.object_id;
@@ -546,6 +642,7 @@
     if (!images.length) elements["result-images"].append(createNode("li", "result-image-meta", "暂无可用图片记录"));
     renderQuality(profile, images);
     renderSegmentation(profile, images, objectId);
+    renderUnderstanding(profile, images);
 
     elements["missing-information"].replaceChildren();
     let missing = profile.missing_information;
@@ -636,7 +733,7 @@
       formData.append("segmentation_boxes", JSON.stringify(selectedFiles.map((entry) => entry.segmentationBox)));
     }
     setBusy(true);
-    elements["upload-status"].textContent = "正在上传、评估图像质量并处理已配置的分割任务，请保持页面打开…";
+    elements["upload-status"].textContent = "正在上传、评估图像质量并执行已配置的视觉任务，请保持页面打开…";
     try {
       const response = await fetch("/api/v1/objects", { method: "POST", body: formData, headers: { Accept: "application/json" } });
       let payload;

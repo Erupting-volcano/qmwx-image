@@ -22,6 +22,7 @@ def png_bytes():
 @pytest.fixture
 def settings(tmp_path):
     return Settings(data_dir=tmp_path / "data", segmentation_enabled=False, segmentation_backend="baidu",
+                    recognition_enabled=False, recognition_api_key="",
                     segmentation_api_key="", segmentation_secret_key="")
 
 
@@ -37,6 +38,7 @@ def client_factory(tmp_path):
 
     def factory(*, processors=None, **overrides):
         config_values = {"segmentation_enabled": False, "segmentation_backend": "baidu",
+                         "recognition_enabled": False, "recognition_api_key": "",
                          "segmentation_api_key": "", "segmentation_secret_key": ""}
         config_values.update(overrides)
         config = Settings(data_dir=tmp_path / f"data-{len(clients)}", **config_values)

@@ -103,7 +103,10 @@ def public_config(request: Request) -> dict:
             "segmentation_model_version": selected["model_version"],
             "segmentation_provider": selected["name"],
             "segmentation_status": selected["status"] if settings.segmentation_enabled else "disabled",
-            "segmentation_message": selected["reason"], "segmentation_capabilities": selected["capabilities"]}
+            "segmentation_message": selected["reason"], "segmentation_capabilities": selected["capabilities"],
+            "recognition_enabled": settings.recognition_enabled,
+            "recognition_backend": settings.recognition_backend, "recognition_model": settings.recognition_model,
+            "recognition_max_images": settings.recognition_max_images}
 
 
 def _parse_segmentation_boxes(values: list, image_count: int) -> list[NormalizedBox | None]:

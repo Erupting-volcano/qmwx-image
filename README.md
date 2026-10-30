@@ -1,10 +1,10 @@
 # 其命维新——物体信息输入与数字化模块 V0.1
 
-这是旧物改造辅助项目「其命维新」的物体信息输入与数字化模块，为后续改造方案生成、几何约束验证和操作规划提供标准化物体档案。V0.1 负责图片采集、合法性检查、基础元数据、图像质量筛查和统一数据输出，并提供统一的多模型分割接口与可选框选分割。目前只有百度智能云“智能抠图”API 已实现真实推理适配；SAM 2.1 Hiera Tiny 仅登记能力和配置，尚未实现推理。基础环境使用 Python、Pydantic 和 Pillow；FastAPI 与中文页面是接入适配层和调试入口，本次不安装 PyTorch 或下载模型权重。
+这是旧物改造辅助项目「其命维新」的物体信息输入与数字化模块，为后续改造方案生成、几何约束验证和操作规划提供标准化物体档案。V0.1 负责图片采集、合法性检查、基础元数据、图像质量筛查和统一数据输出，并提供统一的多模型分割接口与可选框选分割。分割目前只有百度智能云“智能抠图”API 已实现真实推理适配；SAM 2.1 Hiera Tiny 仅登记能力和配置，尚未实现推理。另有独立的视觉语言模型管理框架与物体理解模块，首个后端为 Qwen3-VL-Plus / DashScope OpenAI 兼容接口。基础环境使用 Python、Pydantic 和 Pillow；FastAPI 与中文页面是接入适配层和调试入口，本次不安装 PyTorch 或下载模型权重。
 
-处理流程：**多图输入 → 限量写入与验证 → 元数据模块 → 图像质量筛查 → 可选框选分割 → 统一档案校验 → 原子保存**。默认模块顺序为 `ImageMetadataProcessor → ImageQualityProcessor → ObjectSegmentationProcessor`。
+处理流程：**多图输入 → 限量写入与验证 → 元数据模块 → 图像质量筛查 → 可选框选分割 → 可选物体理解 → 统一档案校验 → 原子保存**。默认模块顺序为 `ImageMetadataProcessor → ImageQualityProcessor → ObjectSegmentationProcessor`；启用物体理解后追加 `ObjectUnderstandingProcessor`，保持关闭时已有默认结果兼容。
 
-当前能力包括基础图片信息、质量筛查，以及开通百度智能抠图并配置服务端密钥后的云端分割。分割默认未启用；需要用户在照片上框选目标，不会按物体名称自动定位。选择并启用百度后端后，带有效目标框的照片会经后端 HTTPS 发送至百度云处理，可能产生调用费用；原图、掩码和 JSON 档案仍保存在本地。没有接入物体类别识别、材料识别、尺寸估计、三维重建或 CAD 建模；这些结果仍为未知。没有标尺或相机标定时，不会虚构物体尺寸。“高精度”是后续目标，不是 V0.1 的精度承诺。
+当前能力包括基础图片信息、质量筛查，以及开通百度智能抠图并配置服务端密钥后的云端分割。分割默认未启用；需要用户在照片上框选目标，不会按物体名称自动定位。选择并启用百度后端后，带有效目标框的照片会经后端 HTTPS 发送至百度云处理，可能产生调用费用；原图、掩码和 JSON 档案仍保存在本地。可选物体理解可输出有来源的类别候选、外观、材料候选、可见部件和语义视角；不接入尺寸估计、三维重建或 CAD 建模。AI 候选不等于材质验证或用户确认。没有标尺或相机标定时，不会虚构物体尺寸。“高精度”是后续目标，不是 V0.1 的精度承诺。
 
 ## 接入主项目
 
@@ -36,7 +36,7 @@ except CollectionError as error:
 
 `ImageInput.stream` 是调用方提供的二进制文件流，从当前位置读取，由调用方负责关闭，也可以使用 `io.BytesIO`。`collect()` 返回已经落盘的 `ObjectProfile`；`collector.get_profile(object_id)` 可重新读取。每次调用创建一份新的收集记录，V0.1 不负责向主项目已有档案追加图片、管理用户权限或操作主项目数据库。
 
-为兼容原始数据契约，返回模型仍称为 `ObjectProfile`，HTTP 路径仍为 `/api/v1/objects`；其中类别、材料、测量、几何和部件是留给主项目后续处理的明确空值或默认状态。主项目可保存 `object_id` 与自身业务 ID 的对应关系。`storage_path` 始终相对于本模块的数据目录，主项目解析路径时需要使用同一个数据根目录。
+为兼容原始数据契约，返回模型仍称为 `ObjectProfile`，HTTP 路径仍为 `/api/v1/objects`；其中未知字段保持空值或默认状态；启用物体理解后可补充经校验的候选，但不把模型猜测升级为用户确认。主项目可保存 `object_id` 与自身业务 ID 的对应关系。`storage_path` 始终相对于本模块的数据目录，主项目解析路径时需要使用同一个数据根目录。
 
 ## 环境与安装
 
@@ -92,7 +92,7 @@ python -m venv .venv
 | --- | --- | --- |
 | `GET /` | 中文网页 | HTML |
 | `GET /health` | 服务状态 | `200`，含 `status: "ok"` |
-| `GET /api/v1/config` | 获取图片限制、所选分割后端、能力与配置状态 | `200`，不包含服务器目录或密钥 |
+| `GET /api/v1/config` | 获取图片限制、所选分割状态及物体理解启用信息 | `200`，不包含服务器目录或密钥 |
 | `POST /api/v1/objects` | 上传图片、执行模块并创建档案 | `201`，含 `object_id`、`status`、`profile` |
 | `GET /api/v1/objects/{object_id}` | 读取完整档案 | `200`，ObjectProfile JSON |
 | `GET /api/v1/objects/{object_id}/profile.json` | 下载档案 | `200`，JSON 附件 |
@@ -151,7 +151,7 @@ $env:DIGITIZER_MAX_FILES = "10"
 - `materials`、`components`：结构化候选列表。空列表表示尚无结果，不表示已确认不存在。
 - `measurements`：默认包含 length、width、height 的空占位，不表示物体被假定为长方体；参数名称可扩展为厚度、孔径、孔距等。未知时 `value`、`unit` 和 `uncertainty` 为 `null`，`status`、`source` 为 `unknown`，`verified_by_user` 为 `false`。状态区分 `unknown`、`estimated`、`measured`、`confirmed`。不确定度表示与测量值相同单位的绝对误差。`confirmed` 必须显式记录用户确认或 `verification_method` 独立验证依据；算法输出数值不会自动升级为已确认。
 - `geometry`：默认 `scale_status: "uncalibrated"`、`model_status: "not_started"`，所有模型路径为 `null`。`mesh_role` 区分 `unknown`、`appearance` 外观网格、`engineering` 工程几何；`engineering_status` 初始 `not_validated`，模型生成成功不等于通过工程验证。已校准必须记录 `scale_reference`，通过工程验证还必须记录验证方法。`quality_notes`、`unknown_regions` 留作质量描述与未知区域，空列表表示尚未评估。
-- `component_relations`：通过部件 UUID 引用的结构或空间关系，默认空列表；引用必须属于当前档案。材料、部件、关系标记为 `confirmed` 时也需要显式验证依据。V0.1 不实际识别或生成这些结果。
+- `component_relations`：通过部件 UUID 引用的结构或空间关系，默认空列表；引用必须属于当前档案。材料、部件、关系标记为 `confirmed` 时也需要显式验证依据。物体理解仅补充可见部件的观察/候选，不生成隐藏结构或部件空间关系。
 - `missing_information`：列出仍待补充的档案字段，包括类别、材料、尺寸、几何和部件等。
 - `processing_results`：按执行顺序保留各模块的数据、状态、警告和错误；模块状态支持 `success`、`partial`、`skipped`、`failed`、`needs_input`。
 - `warnings`：汇总需要关注的问题。缺失信息和模块处理状态具有不同含义，完整执行元数据模块不代表已经取得物体的真实尺寸或模型。
@@ -172,6 +172,12 @@ app/
   modules/segmentation_factory.py 模型注册、能力与部署状态查询、延迟工厂
   modules/sam2_backend.py         SAM 2.1 接入占位，尚无推理实现
   modules/baidu_backend.py        百度智能抠图 HTTP 接口与掩码回映射
+  modules/recognition_backend.py  视觉语言模型请求、结果、能力及协议
+  modules/recognition_factory.py  VLM 注册、延迟初始化和任务级模型路由
+  modules/openai_compatible_backend.py  DashScope / 兼容 Chat 接口适配
+  modules/object_understanding_processor.py  单图组合观察与多视角语义融合
+  modules/object_understanding/   六项独立分析任务及输出校验
+  prompts/object_understanding/   独立提示词与版本
   services/pipeline.py            顺序执行、异常隔离和结果交接
   services/profile_assembler.py   类型校验、适配器合并与缺失信息整理
   services/image_collection.py    主项目可直接调用的收集服务与输入接口
@@ -200,7 +206,7 @@ HTTP 解析器目前在图片超过 1 MiB 时将上传流写入磁盘，然后�
 
 ## 图像质量筛查
 
-默认流水线按 `ImageMetadataProcessor → ImageQualityProcessor` 执行。质量结果保存在 `processing_results` 中 `module_name: "image_quality"` 的 `data`，创建、查询和 JSON 下载均可取得，不增加档案顶层字段，也不改变 `schema_version: "0.1.0"`。
+默认流水线在元数据后执行 `ImageQualityProcessor`。质量结果保存在 `processing_results` 中 `module_name: "image_quality"` 的 `data`，创建、查询和 JSON 下载均可取得，不增加档案顶层字段，也不改变 `schema_version: "0.1.0"`。
 
 每张成功检查的图片记录 `asset_id`、`filename`、原始 `width/height`、实际分析图 `analysis_width/analysis_height`、`mean_luminance`、`contrast_stddev`、`edge_strength`、`status`、`issues` 和中文 `suggestions`。使用资源 UUID 关联图片，同名文件仍分别记录。批量数据包含 `input_count`、`checked_count`、`review_count`；检查失败的图片保存在标准结果的 `errors` 中，不能当作通过筛查。
 
@@ -241,6 +247,18 @@ $env:DIGITIZER_SEGMENTATION_BACKEND = "baidu"
 掩码与候选掩码均为转正原图大小的独立 `L` PNG，`255` 为前景、`0` 为背景；沿用原有事务保存、提交、回滚和路径检查，不把像素矩阵塞进 JSON。结果仍位于 `processing_results` 的 `object_segmentation`，不增加档案顶层字段或改变数据版本。页面预览主要掩码，并显示模型状态、分数类型与拍摄提示；本次没有候选选择平台。
 
 分割默认关闭。仅选择百度、启用且提交有效目标框后，照片才会经后端 HTTPS 发送至百度云；发送的是整张经过方向和尺寸适配的照片，可能产生调用费用。当前百度能力、SAM2 预留能力、模型注册示例、配置与错误排查见[分割模块说明](docs/segmentation.md)。`.env.example` 只是变量参考，程序不会自动加载 `.env`。本次测试只验证框架和模拟 HTTP 契约，没有付费调用、真实 SAM2 推理或模型精度验收。
+
+## 物体理解与视觉语言模型
+
+视觉语言模型管理和任务定义分别维护。首版通过可配置的 DashScope OpenAI 兼容接口接入 `qwen3-vl-plus`，默认关闭；没有 API Key 时仍可上传、评估质量和执行独立配置的分割。只有能力经过明确声明且配置齐全的已注册模型才能执行，不会因为接口兼容就假设支持 JSON Schema、多轮或视频。
+
+六项任务分别负责分类、外观、材料候选、可见部件、单图语义视角和多视角语义融合。每项都有独立提示词、版本、Pydantic 结构和来源校验。默认每图将前五项组合成一次请求，多张有效图片再额外融合一次；任务级模型覆盖可将指定任务分给其他已注册模型。模型不与任务或提示词耦合。
+
+启用后，照片和已校验观察会发送至服务端配置的模型服务商，可能计费。需要从控制台核对地域、业务空间 URL、Key 和模型权限；旧 DashScope 默认地址只是兼容参考，不保证所有新账号可直接使用。`.env.example` 不会自动加载，真实密钥只放服务端环境变量。
+
+观察结果保存在 `processing_results` 中 `module_name: "object_understanding"` 的 `data`；每项重要信息保留 `asset_ids` 与依据，材料只能为 `candidate`，部件不自动确认。共同证据、不同视角的冲突和未知项分别保留；单图或融合失败不会抹掉其他有效结果，不生成真实尺寸或几何。页面可查看候选、来源和冲突，原有查询/JSON 下载仍可读取完整结果。
+
+成功且图片、提示词和路由未变化的同档案历史可复用；每次 `collect()` 创建新档案，不做跨档案身份匹配或去重。当前测试只验证框架和模拟请求，不是 Qwen 真实照片识别效果验收。配置、注册第二种模型、任务路由、调用次数、来源和错误处理见[物体理解说明](docs/object_understanding.md)。
 
 ## 添加处理模块
 
@@ -294,13 +312,13 @@ pipeline = Pipeline(
 
 Python 集成时使用 `ImageCollectionService(pipeline=pipeline)`；HTTP 集成时使用 `create_app(pipeline=pipeline)` 创建应用，接口和网页无需修改。需要新档案字段时，在对应统一模型中显式定义类型；仅产生模块专属结果时，可以保存在该模块经过验证的 `data` 中。适配器收到档案副本，最终输出还会统一校验，禁止替换物体身份、原始图片和创建时间等受保护字段。
 
-无适配器的模块仍会保留标准化的模块结果，不会把任意字典自动写入物体档案顶层。内置元数据、质量和分割模块均有专用输出模型与适配器，通过 `asset_id` 对应图片；质量与分割适配器只验证结果，不改写物体事实。分割文件另由流水线和存储层检查真实存在、归属及几何一致性。显式传入 `processors` 或 `pipeline` 时仍完全采用调用方配置，不自动追加默认模块。
+无适配器的模块仍会保留标准化的模块结果，不会把任意字典自动写入物体档案顶层。内置元数据、质量、分割和物体理解模块均有专用输出模型与适配器，通过 `asset_id` 对应图片；质量与分割适配器只验证结果，物体理解只补充经校验的候选，不覆盖确认信息。分割文件另由流水线和存储层检查真实存在、归属及几何一致性。显式传入 `processors` 或 `pipeline` 时仍完全采用调用方配置，不自动追加默认模块。
 
 `Pipeline.run(existing_profile, data_dir)` 和 `ProfileAssembler.merge_result(existing_profile, result)` 可以在已有档案副本上继续补充数据，保留已有模块记录。当前 HTTP 创建接口和 `collect()` 每次创建新档案；面向同一档案的持久化更新、追加图片及并发修订接口尚未实现，后续可在现有数据契约上增量加入。
 
 V0.1 在当前 HTTP 请求内顺序处理。后续接入耗时三维重建时，应在现有 Pipeline 外增加任务调度、进度查询和恢复机制；请求路由、模块算法与数据契约各自演进。
 
-后续路线依次为真实照片阈值校准与更细致的采集引导、COLMAP 多视角重建、Open3D 点云处理与几何分析、真实尺度校准与误差验证、视觉理解与分割、规则几何 CAD 导出，以及复杂物体的局部结构与质量验证。COLMAP、Open3D、CadQuery 均未作为当前依赖安装。复杂物体可以保留经过校准的网格、局部结构和未知区域，无需强行生成参数化 CAD。
+后续路线依次为真实照片阈值校准与更细致的采集引导、COLMAP 多视角重建、Open3D 点云处理与几何分析、真实尺度校准与误差验证、更多视觉后端与真实照片效果校准、规则几何 CAD 导出，以及复杂物体的局部结构与质量验证。COLMAP、Open3D、CadQuery 均未作为当前依赖安装。复杂物体可以保留经过校准的网格、局部结构和未知区域，无需强行生成参数化 CAD。
 
 ## 自动化测试
 
@@ -320,7 +338,9 @@ V0.1 在当前 HTTP 请求内顺序处理。后续接入耗时三维重建时，
 
 分割测试覆盖空/全图/异常掩码、服务与鉴权不可用、提示与 EXIF 坐标、混合图片故障、PNG 文件保存与安全预览、产物残留清理及提交失败回滚。云 API 边界通过模拟请求验证，不会在默认测试中发送照片到外部服务或产生费用；模拟返回不能视为已完成真实云端推理验证。
 
-2026-10-30 多模型框架版本全量测试为 **453 passed、1 skipped、1 warning**，包含 15 组页面 DOM 回归；真实付费 API 烟测跳过。测试验证接口和流程，没有执行真实 SAM2 推理或模型精度验收。
+2026-10-30 视觉语言模型框架与物体理解版本全量测试为 **599 passed、1 skipped、1 warning**，包含 21 组页面 DOM 回归。仅使用测试后端与模拟 HTTP；没有真实付费 API 调用、Qwen 照片识别精度验收或本地大型模型部署。唯一警告仍为既有 Starlette TestClient/httpx 弃用提示。
+
+历史记录：2026-10-30 多模型分割框架版本全量测试为 **453 passed、1 skipped、1 warning**，包含 15 组页面 DOM 回归；真实付费 API 烟测跳过。测试验证接口和流程，没有执行真实 SAM2 推理或模型精度验收。
 
 历史记录：2026-10-30 单一百度 API 版本完整测试结果为 **371 passed、1 skipped、1 warning**；跳过的是需要明确启用和真实凭证的付费 API 烟测。另有 13 组前端 DOM 回归通过。模拟请求测试未调用真实服务。
 

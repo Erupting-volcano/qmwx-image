@@ -7,7 +7,8 @@ from uuid import UUID, uuid4
 
 from app.models.image_asset import ImageAsset
 from app.models.image_quality import ImageQualityData
-from app.models.object_profile import ObjectProfile
+from app.models.object_profile import ComponentInfo, MaterialCandidate, ObjectProfile
+from app.models.object_understanding import ObjectUnderstandingData, validate_sources
 from app.models.processing_result import ImageMetadataData, ProcessingError, ProcessingResult
 from app.models.segmentation import SegmentationData
 
@@ -30,6 +31,7 @@ class ProfileAssembler:
             "image_metadata": _AdapterRegistration(self._merge_image_metadata, editable_images=True),
             "image_quality": _AdapterRegistration(self._validate_image_quality),
             "object_segmentation": _AdapterRegistration(self._validate_segmentation),
+            "object_understanding": _AdapterRegistration(self._merge_understanding),
         }
 
     def register_adapter(self, module_name: str, adapter: ProfileAdapter) -> None:
@@ -38,6 +40,38 @@ class ProfileAssembler:
         if not callable(adapter):
             raise TypeError("模块合并适配器必须可调用")
         self._adapters[module_name] = _AdapterRegistration(adapter)
+
+    @staticmethod
+    def validate_understanding(profile: ObjectProfile, result: ProcessingResult) -> ObjectUnderstandingData:
+        data = ObjectUnderstandingData.model_validate(result.data)
+        known_ids = {image.asset_id for image in profile.images}
+        if data.input_count != len(known_ids) or {state.asset_id for state in data.image_states} != known_ids:
+            raise ValueError("物体理解结果必须对应当前档案的输入图片")
+        validate_sources(data, known_ids)
+        return data
+
+    @staticmethod
+    def _merge_understanding(profile: ObjectProfile, result: ProcessingResult) -> ObjectProfile:
+        data = ProfileAssembler.validate_understanding(profile, result)
+        # category has no candidate status: keep AI categories in typed history.
+        # Existing entries, including every confirmed/user value, are preserved.
+        materials = data.material_candidates or [item for image in data.image_observations for item in image.material_candidates]
+        components = data.components or [item for image in data.image_observations for item in image.visible_components]
+        material_names = {item.name.casefold().strip() for item in profile.materials}
+        component_names = {item.name.casefold().strip() for item in profile.components}
+        for item in materials:
+            key = item.material_name.casefold().strip()
+            if key not in material_names:
+                profile.materials.append(MaterialCandidate(name=item.material_name, confidence=item.confidence,
+                    source="algorithm_estimate", status="candidate"))
+                material_names.add(key)
+        for item in components:
+            key = item.component_name.casefold().strip()
+            if key not in component_names:
+                profile.components.append(ComponentInfo(name=item.component_name, description=item.description,
+                    source="algorithm_estimate", status="detected"))
+                component_names.add(key)
+        return profile
 
     def create_profile(
         self, name: str, images: list[ImageAsset], object_id: UUID | None = None,
@@ -159,7 +193,7 @@ class ProfileAssembler:
                     status="failed",
                     # Rejected mask files are discarded by the transaction; do not
                     # persist their old successful records as usable artifact links.
-                    data={} if accepted_result.module_name == "object_segmentation" else accepted_result.data,
+                    data={} if accepted_result.module_name in {"object_segmentation", "object_understanding"} else accepted_result.data,
                     warnings=accepted_result.warnings,
                     errors=[*accepted_result.errors, ProcessingError(
                         code="invalid_module_data",

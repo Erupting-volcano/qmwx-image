@@ -19,7 +19,11 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from PIL import Image, UnidentifiedImageError
 
-from app.modules.segmentation_backend import MaskPrediction, SegmentationAPIError, SegmentationUnavailable
+from app.modules.segmentation_backend import (
+    AutomaticPrompt, BoxPrompt, MaskPrediction, SegmentationAPIError,
+    SegmentationCapabilities, SegmentationRequest, SegmentationUnavailable,
+    check_request_capabilities,
+)
 
 
 MODEL_NAME = "baidu_intelligent_segmentation"
@@ -40,7 +44,11 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 class BaiduSegmentationBackend:
+    model_id = "baidu"
+    # The API does not publish the underlying neural architecture/version.
+    model_version = "service-unversioned"
     model_name = MODEL_NAME
+    capabilities = SegmentationCapabilities(box_prompt=True, automatic_mask=True)
 
     def __init__(self, api_key: str, secret_key: str, timeout_seconds: float = 30, *, opener=None) -> None:
         if not isinstance(api_key, str) or not isinstance(secret_key, str):
@@ -128,29 +136,32 @@ class BaiduSegmentationBackend:
             return token
 
     @staticmethod
-    def _prepare_image(image: Image.Image, box: tuple[float, float, float, float]):
+    def _prepare_image(image: Image.Image, box: tuple[float, float, float, float] | None):
         if not isinstance(image, Image.Image) or image.mode != "RGB" or min(image.size) <= 0:
             raise SegmentationAPIError("分割API需要已转正的有效RGB图片。")
-        if (not isinstance(box, (tuple, list)) or len(box) != 4
-                or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in box)):
-            raise SegmentationAPIError("目标框坐标无效，请重新框选。")
-        x0, y0, x1, y1 = box
         width, height = image.size
-        if not 0 <= x0 < x1 <= width or not 0 <= y0 < y1 <= height:
-            raise SegmentationAPIError("目标框超出图片范围，请重新框选。")
+        if box is not None:
+            if (not isinstance(box, (tuple, list)) or len(box) != 4
+                    or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in box)):
+                raise SegmentationAPIError("目标框坐标无效，请重新框选。")
+            x0, y0, x1, y1 = box
+            if not 0 <= x0 < x1 <= width or not 0 <= y0 < y1 <= height:
+                raise SegmentationAPIError("目标框超出图片范围，请重新框选。")
         scale = min(1.0, MAX_API_SIDE / max(width, height))
         scaled_size = (max(1, int(width * scale)), max(1, int(height * scale)))
         api_size = (max(MIN_API_SIDE, scaled_size[0]), max(MIN_API_SIDE, scaled_size[1]))
         left = (api_size[0] - scaled_size[0]) // 2
         top = (api_size[1] - scaled_size[1]) // 2
-        transformed = (math.floor(x0 * scaled_size[0] / width + left),
-                       math.floor(y0 * scaled_size[1] / height + top),
-                       math.ceil(x1 * scaled_size[0] / width + left),
-                       math.ceil(y1 * scaled_size[1] / height + top))
-        api_box = (max(1, transformed[0]), max(1, transformed[1]),
-                   min(api_size[0] - 1, transformed[2]), min(api_size[1] - 1, transformed[3]))
-        if api_box[2] - api_box[0] < 10 or api_box[3] - api_box[1] < 10:
-            raise SegmentationAPIError("目标框映射到API图片后小于10×10像素，请框住更完整的物体或补拍近景。")
+        api_box = transformed = None
+        if box is not None:
+            transformed = (math.floor(x0 * scaled_size[0] / width + left),
+                           math.floor(y0 * scaled_size[1] / height + top),
+                           math.ceil(x1 * scaled_size[0] / width + left),
+                           math.ceil(y1 * scaled_size[1] / height + top))
+            api_box = (max(1, transformed[0]), max(1, transformed[1]),
+                       min(api_size[0] - 1, transformed[2]), min(api_size[1] - 1, transformed[3]))
+            if api_box[2] - api_box[0] < 10 or api_box[3] - api_box[1] < 10:
+                raise SegmentationAPIError("目标框映射到API图片后小于10×10像素，请框住更完整的物体或补拍近景。")
         warnings = []
         if scaled_size != image.size:
             warnings.append("图片已等比缩小至API允许尺寸，掩码将映射回原图；边界精度受缩小分辨率影响。")
@@ -207,21 +218,45 @@ class BaiduSegmentationBackend:
         except (binascii.Error, ValueError, UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError):
             raise SegmentationAPIError("百度分割API返回的掩码无法安全解码。") from None
 
-    def predict(self, image: Image.Image, box: tuple[float, float, float, float]) -> MaskPrediction:
+    def predict(
+        self, request: SegmentationRequest | Image.Image,
+        box: tuple[float, float, float, float] | None = None,
+    ) -> MaskPrediction:
+        """Use a typed request, retaining the explicit legacy ``(image, box)`` call.
+
+        Automatic mode requires AutomaticPrompt; omitting a box from a legacy
+        call never silently changes its meaning to automatic segmentation.
+        """
+        started = time.perf_counter()
+        if isinstance(request, Image.Image):
+            try:
+                request = SegmentationRequest(request, BoxPrompt(box))
+            except (TypeError, ValueError):
+                raise SegmentationAPIError("图片或目标框无效，请提供已转正的RGB图片及有效像素坐标。") from None
+        elif not isinstance(request, SegmentationRequest) or box is not None:
+            raise SegmentationAPIError("分割输入必须是统一请求，或明确的图片与目标框。")
+        # Capability rejection precedes all credential checks and HTTP requests.
+        check_request_capabilities(request, self.capabilities)
+        image = request.image
+        prompt_box = request.prompt.box if isinstance(request.prompt, BoxPrompt) else None
+        method = "auto" if isinstance(request.prompt, AutomaticPrompt) else "control"
         if not self._api_key or not self._secret_key:
             raise SegmentationUnavailable("尚未配置百度API Key和Secret Key，请配置后重启服务；不会使用本地模型或伪造掩码。")
-        prepared, api_box, region, warnings = self._prepare_image(image, box)
+        prepared, api_box, region, warnings = self._prepare_image(image, prompt_box)
+        if method == "auto":
+            warnings.append("自动模式提取画面中的主体，不保证与预期目标一致，请人工核对。")
         with prepared:
             encoded = self._encode_image(prepared, warnings)
             api_size = prepared.size
         token = self._access_token()
-        body = json.dumps({"image": encoded, "method": "control",
-                           "position": [[[api_box[0], api_box[1]], [api_box[2], api_box[3]]]],
-                           "return_form": "mask", "refine_mask": "false"}, separators=(",", ":")).encode("utf-8")
-        request = Request(SEGMENT_URL + "?" + urlencode({"access_token": token}), data=body,
-                          headers={"Content-Type": "application/json"}, method="POST")
+        parameters = {"image": encoded, "method": method, "return_form": "mask", "refine_mask": "false"}
+        if api_box is not None:
+            parameters["position"] = [[[api_box[0], api_box[1]], [api_box[2], api_box[3]]]]
+        body = json.dumps(parameters, separators=(",", ":")).encode("utf-8")
+        http_request = Request(SEGMENT_URL + "?" + urlencode({"access_token": token}), data=body,
+                               headers={"Content-Type": "application/json"}, method="POST")
         try:
-            payload = self._request_json(request, MAX_RESPONSE_BYTES)
+            payload = self._request_json(http_request, MAX_RESPONSE_BYTES)
         except SegmentationUnavailable:
             self._invalidate_token(token)
             raise
@@ -236,4 +271,11 @@ class BaiduSegmentationBackend:
         with self._decode_mask(payload.get("image"), api_size, warnings) as api_mask:
             with api_mask.crop(region) as unpadded:
                 mask = unpadded.resize(image.size, Image.Resampling.NEAREST) if unpadded.size != image.size else unpadded.copy()
-        return MaskPrediction(mask=mask, score=None, warnings=tuple(warnings))
+        return MaskPrediction(
+            mask=mask, score=None, warnings=tuple(warnings),
+            model_id=self.model_id, model_version=self.model_version,
+            processing_time=max(0.0, time.perf_counter() - started),
+            # Only allowlisted, small non-secret data crosses the backend boundary.
+            # Raw provider responses may contain diagnostics or credentials.
+            extensions={self.model_id: {"api_mode": method}},
+        )

@@ -10,6 +10,7 @@ import pytest
 @pytest.mark.parametrize("scenario", [
     "box_coordinates", "pointer_cancel_and_clear", "selection_identity", "oriented_scaled_image",
     "mixed_results", "disabled_and_old_archive", "failed_diagnostic_data",
+    "selected_backend_availability", "score_semantics_and_candidates",
 ])
 def test_segmentation_selection_and_safe_result_display(scenario):
     node = shutil.which("node")

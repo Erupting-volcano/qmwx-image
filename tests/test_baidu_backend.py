@@ -15,7 +15,11 @@ import pytest
 
 from app.modules import baidu_backend as api
 from app.modules.baidu_backend import BaiduSegmentationBackend
-from app.modules.segmentation_backend import SegmentationAPIError, SegmentationUnavailable
+from app.modules.segmentation_backend import (
+    AutomaticPrompt, BoxPrompt, MaskPrompt, PointPrompt, SegmentationAPIError,
+    SegmentationBackend, SegmentationRequest, SegmentationUnavailable,
+    TextPrompt, UnsupportedPromptError,
+)
 
 
 TOKEN = "TEST_ACCESS_TOKEN_PRIVATE"
@@ -384,3 +388,89 @@ def test_redirect_handler_refuses_credential_forwarding():
     assert handler.redirect_request(None, None, 302, "moved", {}, "https://attacker.invalid/") is None
     default = BaiduSegmentationBackend(KEY, SECRET)
     assert any(isinstance(item, api._NoRedirect) for item in default._opener.handlers)
+
+
+def test_typed_box_request_implements_backend_protocol_and_preserves_provider_identity(rgb, monkeypatch):
+    ticks = iter([10.0, 10.375])
+    monkeypatch.setattr(api.time, "perf_counter", lambda: next(ticks))
+    instance, opener = backend(token(), {**mask_response(), "log_id": SECRET, "score": 0.99})
+    assert isinstance(instance, SegmentationBackend)
+    result = instance.predict(SegmentationRequest(rgb, BoxPrompt(BOX)))
+    with result.mask:
+        assert result.mask.mode == "L" and result.mask.size == rgb.size
+        assert set(result.mask.tobytes()) == {0, 255}
+    assert result.model_id == "baidu"
+    assert result.model_version == "service-unversioned"
+    assert result.processing_time == pytest.approx(0.375)
+    assert result.score is None and result.score_type is None
+    assert result.candidates == ()
+    assert result.extensions == {"baidu": {"api_mode": "control"}}
+    evidence = repr(result.extensions)
+    assert all(value not in evidence for value in (KEY, SECRET, TOKEN))
+    payload = json.loads(opener.calls[1][0].data)
+    assert payload["position"] == [[[16, 20], [220, 170]]]
+
+
+def test_automatic_request_uses_official_auto_mode_without_invented_box(rgb):
+    instance, opener = backend(token(), mask_response())
+    result = instance.predict(SegmentationRequest(rgb, AutomaticPrompt()))
+    with result.mask:
+        assert result.mask.mode == "L" and result.mask.size == rgb.size
+        assert result.mask.getpixel((30, 40)) == 255
+    assert instance.capabilities.automatic_mask is True
+    assert instance.capabilities.box_prompt is True
+    assert instance.capabilities.point_prompt is False
+    assert instance.capabilities.quality_score is False
+    assert result.score is None and result.score_type is None
+    assert result.extensions == {"baidu": {"api_mode": "auto"}}
+    payload = json.loads(opener.calls[1][0].data)
+    assert payload["method"] == "auto"
+    assert "position" not in payload
+    assert set(payload) == {"image", "method", "return_form", "refine_mask"}
+
+
+def test_automatic_mask_maps_through_padding_without_mutating_original():
+    with Image.new("L", (128, 128)) as returned:
+        ImageDraw.Draw(returned).rectangle((48, 52, 79, 75), fill=255)
+        instance, opener = backend(token(), {"image": png64(returned)})
+    with Image.new("RGB", (32, 24), (17, 43, 111)) as image:
+        before = image.tobytes()
+        result = instance.predict(SegmentationRequest(image, AutomaticPrompt()))
+        with result.mask:
+            assert result.mask.size == image.size and result.mask.getextrema() == (255, 255)
+        assert image.tobytes() == before
+    assert any("白色边距" in item for item in result.warnings)
+    assert not any("提示框" in item for item in result.warnings)
+    assert "position" not in json.loads(opener.calls[1][0].data)
+
+
+@pytest.mark.parametrize("prompt_factory", [
+    lambda size: PointPrompt(points=((20.0, 30.0),), labels=(1,)),
+    lambda size: TextPrompt("杯子"),
+    lambda size: MaskPrompt(Image.new("L", size, 0)),
+])
+def test_unimplemented_provider_prompt_is_rejected_before_credentials_or_network(rgb, prompt_factory):
+    prompt = prompt_factory(rgb.size)
+    opener = Opener()
+    instance = BaiduSegmentationBackend("", "", opener=opener)
+    try:
+        with pytest.raises(UnsupportedPromptError):
+            instance.predict(SegmentationRequest(rgb, prompt))
+        assert opener.calls == []
+    finally:
+        if isinstance(prompt, MaskPrompt):
+            prompt.mask.close()
+
+
+def test_legacy_call_without_box_is_not_silently_changed_to_automatic(rgb):
+    instance, opener = backend()
+    with pytest.raises(SegmentationAPIError):
+        instance.predict(rgb)
+    assert opener.calls == []
+
+
+def test_typed_request_cannot_also_supply_a_legacy_box(rgb):
+    instance, opener = backend()
+    with pytest.raises(SegmentationAPIError):
+        instance.predict(SegmentationRequest(rgb, AutomaticPrompt()), BOX)
+    assert opener.calls == []

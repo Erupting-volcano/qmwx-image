@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import math
 import os
 from pathlib import Path
+import re
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -39,6 +40,9 @@ class Settings:
         "DIGITIZER_MAX_IMAGE_PIXELS", 40_000_000
     ))
     segmentation_enabled: bool = field(default_factory=lambda: _env_bool("DIGITIZER_SEGMENTATION_ENABLED"))
+    segmentation_backend: str = field(default_factory=lambda: os.environ.get(
+        "DIGITIZER_SEGMENTATION_BACKEND", "baidu"
+    ).strip())
     segmentation_api_key: str = field(default_factory=lambda: os.environ.get(
         "BAIDU_SEGMENTATION_API_KEY", ""
     ).strip(), repr=False)
@@ -48,6 +52,12 @@ class Settings:
     segmentation_timeout_seconds: float = field(default_factory=lambda: float(os.environ.get(
         "DIGITIZER_SEGMENTATION_TIMEOUT_SECONDS", "30"
     )))
+    # Interfaces for the future local adapter; no existence checks or imports at startup.
+    sam2_checkpoint_path: Path | None = field(default_factory=lambda: (
+        Path(os.environ["SAM2_CHECKPOINT_PATH"].strip())
+        if os.environ.get("SAM2_CHECKPOINT_PATH", "").strip() else None
+    ), repr=False)
+    sam2_device: str = field(default_factory=lambda: os.environ.get("SAM2_DEVICE", "auto").strip().lower())
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data_dir", Path(self.data_dir).expanduser().resolve())
@@ -57,6 +67,13 @@ class Settings:
                 raise ValueError(f"{name} must be a positive integer")
         if not isinstance(self.segmentation_enabled, bool):
             raise ValueError("segmentation_enabled must be a boolean")
+        if (not isinstance(self.segmentation_backend, str)
+                or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}", self.segmentation_backend)):
+            raise ValueError("segmentation_backend must be a model identifier")
+        if self.sam2_checkpoint_path is not None:
+            object.__setattr__(self, "sam2_checkpoint_path", Path(self.sam2_checkpoint_path).expanduser())
+        if not isinstance(self.sam2_device, str):
+            raise ValueError("sam2_device must be text")
         for name in ("segmentation_api_key", "segmentation_secret_key"):
             value = getattr(self, name)
             if not isinstance(value, str) or any(ord(character) < 32 or ord(character) == 127 for character in value):

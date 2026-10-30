@@ -74,7 +74,7 @@ const processingResult = (images, status = "partial") => ({
 });
 const file = (size = 300, name = "same.png") => ({ name, size, type: "image/png", lastModified: size });
 
-async function setup(profile, enabled = true) {
+async function setup(profile, enabled = true, configOverrides = {}) {
   const html = fs.readFileSync(path.join(__dirname, "../app/web/index.html"), "utf8");
   const nodes = Object.fromEntries([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Element("div")]));
   let submission;
@@ -95,7 +95,7 @@ async function setup(profile, enabled = true) {
       append(name, value, filename) { this.entries.push({ name, value, filename }); }
     },
     fetch: async (url, options) => {
-      if (url === "/api/v1/config") return { ok: true, json: async () => ({ segmentation_enabled: enabled }) };
+      if (url === "/api/v1/config") return { ok: true, json: async () => ({ segmentation_enabled: enabled, ...configOverrides }) };
       submission = options.body;
       return { ok: true, status: 201, json: async () => ({ object_id: objectId, status: "completed_with_warnings", profile }) };
     },
@@ -203,6 +203,42 @@ async function main() {
     assert.match(app.nodes["segmentation-config-note"].textContent, /当前未启用/);
     assert.match(app.nodes["segmentation-summary"].textContent, /未执行物体分割/);
     assert.equal(app.nodes["segmentation-images"].querySelectorAll("img").some((image) => image.src.endsWith("/mask")), false);
+  } else if (scenario === "selected_backend_availability") {
+    const sam = await setup(profile, true, { segmentation_backend: "sam2.1_hiera_tiny",
+      segmentation_provider: "Meta SAM 2.1 Hiera Tiny", segmentation_status: "not_implemented",
+      segmentation_message: "SAM 2.1 当前仅登记接口，尚未实现推理。" });
+    assert.match(sam.nodes["segmentation-config-note"].textContent, /Meta SAM 2\.1 Hiera Tiny/);
+    assert.match(sam.nodes["segmentation-config-note"].textContent, /尚未实现推理/);
+    assert.match(sam.nodes["segmentation-config-note"].textContent, /不会自动换用其他模型/);
+    assert.doesNotMatch(sam.nodes["segmentation-config-note"].textContent, /照片会通过后端发送至百度云/);
+    await sam.add([file()]);
+    await sam.submit();
+    const missingKeys = await setup(profile, true, { segmentation_backend: "baidu",
+      segmentation_provider: "百度智能云智能抠图", segmentation_status: "unavailable",
+      segmentation_message: "尚未配置百度应用凭证。" });
+    assert.match(missingKeys.nodes["segmentation-config-note"].textContent, /尚未配置百度应用凭证/);
+    assert.doesNotMatch(missingKeys.nodes["segmentation-config-note"].textContent, /框选分割已启用/);
+    const untrusted = await setup(profile, true, { segmentation_backend: "unknown",
+      segmentation_provider: malicious, segmentation_status: "unavailable", segmentation_message: malicious });
+    assert.ok(untrusted.nodes["segmentation-config-note"].textContent.includes(malicious));
+    assert.equal(untrusted.context.pwned, undefined);
+  } else if (scenario === "score_semantics_and_candidates") {
+    profile.processing_results = [processingResult([record("a", "success", {
+      score: 4.25, score_type: "model_matching_score", confidence: null, model_version: malicious,
+      candidates: [{ mask_path: "../../never-used-in-url.png" }],
+    }), record("b", "success", { score_type: malicious })])];
+    const app = await setup(profile);
+    await app.add([file()]);
+    await app.submit();
+    const [first, second] = app.nodes["segmentation-images"].children;
+    assert.match(first.textContent, /4\.250/);
+    assert.match(first.textContent, /model_matching_score/);
+    assert.match(first.textContent, /不同模型或分数类型不能直接比较/);
+    assert.match(first.textContent, /另保存 1 个候选掩码/);
+    assert.ok(first.textContent.includes(malicious));
+    assert.ok(second.textContent.includes(malicious));
+    assert.ok(app.nodes["segmentation-images"].querySelectorAll("img").every((image) => !image.src.includes("never-used-in-url")));
+    assert.equal(app.context.pwned, undefined);
   } else if (scenario === "failed_diagnostic_data") {
     profile.processing_results = [processingResult([record("a", "success")], "success"),
       processingResult([record("a", "success")], "failed")];

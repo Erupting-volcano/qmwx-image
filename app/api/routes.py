@@ -16,7 +16,9 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from app.config import PROJECT_ROOT, Settings
 from app.models.object_profile import ObjectProfile
-from app.models.segmentation import MODEL_NAME, NormalizedBox, SegmentationData
+from app.models.segmentation import NormalizedBox, SegmentationData
+from app.modules.segmentation_backend import SegmentationUnavailable
+from app.modules.segmentation_factory import describe_backend
 from app.services.image_collection import CollectionError, ImageInput
 from app.storage.local_storage import CorruptProfileError, ProfileNotFoundError, resolve_mask_path, resolve_original_path
 
@@ -88,11 +90,20 @@ def health() -> dict:
 @router.get("/api/v1/config")
 def public_config(request: Request) -> dict:
     settings: Settings = request.app.state.settings
+    try:
+        selected = describe_backend(settings.segmentation_backend, settings).to_public_dict()
+    except SegmentationUnavailable as exc:
+        selected = {"model_name": settings.segmentation_backend, "name": settings.segmentation_backend,
+                    "model_version": None, "status": "unavailable", "reason": str(exc), "capabilities": {}}
     return {"max_files": settings.max_files, "max_image_bytes": settings.max_image_bytes,
             "max_total_bytes": settings.max_total_bytes, "max_image_pixels": settings.max_image_pixels,
             "segmentation_enabled": settings.segmentation_enabled,
-            "segmentation_prompt_type": "box", "segmentation_model": MODEL_NAME,
-            "segmentation_provider": "百度智能云智能抠图"}
+            "segmentation_prompt_type": "box", "segmentation_model": selected["model_name"],
+            "segmentation_backend": settings.segmentation_backend,
+            "segmentation_model_version": selected["model_version"],
+            "segmentation_provider": selected["name"],
+            "segmentation_status": selected["status"] if settings.segmentation_enabled else "disabled",
+            "segmentation_message": selected["reason"], "segmentation_capabilities": selected["capabilities"]}
 
 
 def _parse_segmentation_boxes(values: list, image_count: int) -> list[NormalizedBox | None]:

@@ -18,7 +18,9 @@ from app.modules import image_metadata
 from app.modules.base import ProcessingContext
 from app.modules.baidu_backend import BaiduSegmentationBackend
 from app.modules.object_segmentation import ObjectSegmentationProcessor
-from app.modules.segmentation_backend import MaskPrediction, SegmentationAPIError, SegmentationUnavailable
+from app.modules.segmentation_backend import (
+    MaskCandidate, MaskPrediction, SegmentationAPIError, SegmentationCapabilities, SegmentationUnavailable,
+)
 from app.storage.local_storage import storage_io_path
 
 
@@ -51,10 +53,16 @@ class RecordingStore:
 
 
 class PredictingBackend:
+    model_id = "test_only"
+    model_name = "baidu_intelligent_segmentation"
+    model_version = "test-fixture"
+    capabilities = SegmentationCapabilities(box_prompt=True, multiple_masks=True, quality_score=True)
+
     def __init__(self, outcome="normal", score=0.95):
         self.outcome, self.score, self.calls = outcome, score, []
 
-    def predict(self, image, box):
+    def predict(self, request):
+        image, box = request.image, request.prompt.box
         self.calls.append((image.size, box))
         if self.outcome == "error" or (self.outcome == "second_error" and len(self.calls) == 2):
             raise RuntimeError("PRIVATE_MODEL_PATH_C:\\private\\weights")
@@ -68,7 +76,7 @@ class PredictingBackend:
             mask.putpixel((0, 0), 128)
         if self.outcome == "wrong_size":
             mask = mask.resize((3, 3))
-        return MaskPrediction(mask, self.score)
+        return MaskPrediction(mask, self.score, score_type="predicted_iou")
 
 
 def make_context(tmp_path, contents=None, *, boxes=True, max_pixels=40_000_000):
@@ -142,8 +150,8 @@ def test_empty_prediction_retains_provider_coordinate_mapping_warning(tmp_path):
     mapping_warning = "云端掩码已缩放回原图坐标，请复查边界。"
 
     class EmptyCloudBackend(PredictingBackend):
-        def predict(self, image, box):
-            prediction = super().predict(image, box)
+        def predict(self, request):
+            prediction = super().predict(request)
             return MaskPrediction(prediction.mask, None, warnings=(mapping_warning,))
 
     context = make_context(tmp_path)
@@ -186,8 +194,8 @@ def test_invalid_backend_output_is_isolated_with_safe_errors(tmp_path, outcome):
 def test_safe_api_failure_explanation_is_visible_in_warnings_and_errors(tmp_path):
     safe_message = "百度分割API请求过于频繁，请检查额度后稍后重试；本次未自动重试。"
 
-    class RateLimitedBackend:
-        def predict(self, image, box):
+    class RateLimitedBackend(PredictingBackend):
+        def predict(self, request):
             raise SegmentationAPIError(safe_message)
 
     context = make_context(tmp_path)
@@ -419,8 +427,8 @@ def test_default_processor_uses_cloud_backend_without_requests_at_initialization
 
 def test_provider_processing_notes_are_retained_without_fabricating_confidence(tmp_path):
     class CloudLikePrediction(PredictingBackend):
-        def predict(self, image, box):
-            prediction = super().predict(image, box)
+        def predict(self, request):
+            prediction = super().predict(request)
             return MaskPrediction(prediction.mask, None, warnings=("云端分析经过缩放，边界需要人工复查。",))
 
     result = processor(tmp_path, CloudLikePrediction()).process(make_context(tmp_path))

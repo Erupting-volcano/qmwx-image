@@ -16,7 +16,7 @@ from app.models.segmentation import NormalizedBox, SegmentationData
 from app.modules.image_metadata import ImageMetadataProcessor
 from app.modules.image_quality import ImageQualityProcessor
 from app.modules.object_segmentation import ObjectSegmentationProcessor
-from app.modules.segmentation_backend import MaskPrediction
+from app.modules.segmentation_backend import MaskCandidate, MaskPrediction, SegmentationCapabilities
 from app.services.image_collection import CollectionError, ImageCollectionService, ImageInput
 from app.storage import local_storage
 from app.storage.local_storage import ObjectTransaction, storage_io_path
@@ -24,19 +24,24 @@ from app.storage.local_storage import ObjectTransaction, storage_io_path
 
 class TestOnlyBackend:
     __test__ = False
+    model_id = "test_only"
+    model_name = "baidu_intelligent_segmentation"
+    model_version = "test-fixture"
+    capabilities = SegmentationCapabilities(box_prompt=True, multiple_masks=True, quality_score=True)
 
     def __init__(self, fail_second=False):
         self.calls = []
         self.fail_second = fail_second
 
-    def predict(self, image, box):
+    def predict(self, request):
+        image, box = request.image, request.prompt.box
         self.calls.append((image.size, box))
         if self.fail_second and len(self.calls) == 2:
             raise RuntimeError("PRIVATE_SEGMENTATION_PATH_C:\\private\\model")
         mask = Image.new("L", image.size, 0)
         ImageDraw.Draw(mask).ellipse((image.width // 4, image.height // 4,
                                      image.width * 3 // 4, image.height * 3 // 4), fill=255)
-        return MaskPrediction(mask, 0.9)
+        return MaskPrediction(mask, 0.9, score_type="predicted_iou")
 
 
 def configured_client(settings, backend):

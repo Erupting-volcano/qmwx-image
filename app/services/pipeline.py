@@ -76,11 +76,11 @@ class Pipeline:
                     for image in payload.images:
                         if image.asset_id not in known_images or image.filename != known_images[image.asset_id].filename:
                             raise ValueError("分割结果不属于当前图片资源")
-                        if image.mask_path is not None:
+                        for mask in image.stored_masks():
                             resolve_mask_path(
-                                Path(data_dir), current.object_id, image.asset_id, image.mask_path,
+                                Path(data_dir), current.object_id, image.asset_id, mask.mask_path,
                                 expected_size=(image.width, image.height), max_pixels=max_image_pixels,
-                                expected_bbox=image.bbox, expected_area_ratio=image.area_ratio,
+                                expected_bbox=mask.bbox, expected_area_ratio=mask.area_ratio,
                             )
             except Exception:
                 error_id = uuid4()

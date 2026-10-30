@@ -1,19 +1,82 @@
 """Typed box prompts and API segmentation records, including legacy local masks."""
 
+import json
+import re
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from app.models._common import ContractModel, safe_relative_path
 
 
 MODEL_NAME = "baidu_intelligent_segmentation"
-SegmentationModel = Literal["baidu_intelligent_segmentation", "sam2.1_hiera_tiny"]
+SegmentationModel = Annotated[str, Field(min_length=1, max_length=96, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")]
+ScoreType = Annotated[str, Field(min_length=1, max_length=96, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")]
+MAX_EXTENSION_BYTES = 16 * 1024
 PixelCoordinate = Annotated[int, Field(ge=0, strict=True)]
 SegmentationStatus = Literal[
     "success", "needs_confirmation", "not_found", "failed", "disabled", "unavailable", "needs_input",
 ]
+
+
+def validate_model_extensions(value: object) -> dict:
+    """Small, namespaced JSON only; masks/logits/state binaries belong in files."""
+    if not isinstance(value, dict) or len(value) > 16:
+        raise ValueError("模型扩展必须是有命名空间的小型JSON对象")
+
+    def check(item: object, depth: int = 0) -> None:
+        if depth > 8:
+            raise ValueError("模型扩展层级过深")
+        if item is None or type(item) in {str, int, float, bool}:
+            return
+        if isinstance(item, list):
+            if len(item) > 256:
+                raise ValueError("模型扩展列表过长")
+            for child in item:
+                check(child, depth + 1)
+        elif isinstance(item, dict) and all(isinstance(key, str) for key in item):
+            if len(item) > 256:
+                raise ValueError("模型扩展对象过大")
+            for child in item.values():
+                check(child, depth + 1)
+        else:
+            raise ValueError("模型扩展仅允许JSON类型，不接受二进制或模型对象")
+
+    for namespace, payload in value.items():
+        if (not isinstance(namespace, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", namespace)
+                or not isinstance(payload, dict)):
+            raise ValueError("模型扩展必须使用有效模型标识作为命名空间")
+        check(payload)
+    content = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    if len(content.encode("utf-8")) > MAX_EXTENSION_BYTES:
+        raise ValueError("模型扩展超过16KiB，较大数据应使用独立文件")
+    return json.loads(content)
+
+
+class SegmentationCandidate(ContractModel):
+    """An additional mask using the same source size and coordinates as its parent."""
+
+    mask_path: str
+    bbox: tuple[PixelCoordinate, PixelCoordinate, PixelCoordinate, PixelCoordinate]
+    area_ratio: float = Field(gt=0, le=1)
+    score: float | None = None
+    score_type: ScoreType | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+    @field_validator("mask_path")
+    @classmethod
+    def safe_mask_path(cls, value: str) -> str:
+        value = safe_relative_path(value)
+        if not value.endswith(".png"):
+            raise ValueError("候选掩码必须保存为PNG")
+        return value
+
+    @model_validator(mode="after")
+    def consistent_score(self) -> "SegmentationCandidate":
+        if self.score is None and self.score_type is not None:
+            raise ValueError("无分数时不得声明分数类型")
+        return self
 
 
 class NormalizedBox(ContractModel):
@@ -44,6 +107,13 @@ class SegmentationImage(ContractModel):
     filename: str = Field(min_length=1, max_length=512)
     status: SegmentationStatus
     model_name: SegmentationModel = MODEL_NAME
+    model_id: SegmentationModel | None = None
+    model_version: str | None = Field(default=None, min_length=1, max_length=128)
+    score: float | None = None
+    score_type: ScoreType | None = None
+    processing_time: float | None = Field(default=None, ge=0)
+    extensions: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
+    candidates: list[SegmentationCandidate] = Field(default_factory=list, max_length=16)
     prompt_type: Literal["box", "none"] = "none"
     prompt_box: NormalizedBox | None = None
     width: int | None = Field(default=None, gt=0, strict=True)
@@ -60,6 +130,15 @@ class SegmentationImage(ContractModel):
     )
     warnings: list[str] = Field(default_factory=list)
     error_id: UUID | None = None
+
+    @field_validator("extensions", mode="before")
+    @classmethod
+    def small_namespaced_extensions(cls, value: object) -> dict:
+        return validate_model_extensions(value)
+
+    def stored_masks(self) -> tuple:
+        """Primary and candidate file records share existing safety checks."""
+        return ((self,) if self.mask_path is not None else ()) + tuple(self.candidates)
 
     @field_validator("mask_path")
     @classmethod
@@ -107,6 +186,20 @@ class SegmentationImage(ContractModel):
             raise ValueError("全图掩码需要人工确认")
         if self.status in {"failed", "not_found", "unavailable"} and self.error_id is None:
             raise ValueError("失败或不可用结果必须提供安全错误编号")
+        if self.score is None and self.confidence is None and self.score_type is not None:
+            raise ValueError("无分数时不得声明分数类型")
+        if self.status in {"disabled", "unavailable", "needs_input", "failed", "not_found"} and self.score is not None:
+            raise ValueError("未生成掩码时不得声明预测分数")
+        if self.candidates and not has_mask:
+            raise ValueError("没有主要掩码时不得声明候选掩码")
+        paths = [record.mask_path for record in self.stored_masks()]
+        if len(paths) != len(set(paths)):
+            raise ValueError("主要掩码与候选掩码不得重复引用文件")
+        for candidate in self.candidates:
+            x0, y0, x1, y1 = candidate.bbox
+            if (self.width is None or self.height is None or x0 >= x1 or y0 >= y1
+                    or x1 > self.width or y1 > self.height):
+                raise ValueError("候选掩码边界框超出图像范围或为空")
         return self
 
 

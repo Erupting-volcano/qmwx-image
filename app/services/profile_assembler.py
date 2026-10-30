@@ -57,9 +57,9 @@ class ProfileAssembler:
         if any(image.filename != known_images[image.asset_id].filename for image in payload.images):
             raise ValueError("分割结果的文件名与图片资源不一致")
         for image in payload.images:
-            if image.mask_path is not None:
+            for mask in image.stored_masks():
                 prefix = f"objects/{profile.object_id}/masks/{image.asset_id}_"
-                if not image.mask_path.startswith(prefix):
+                if not mask.mask_path.startswith(prefix):
                     raise ValueError("分割掩码不属于当前物体或图片")
         return profile
 

@@ -269,14 +269,14 @@ class ObjectTransaction(AbstractContextManager):
             for image in payload.images:
                 if image.filename != known_images[image.asset_id].filename:
                     raise ValueError("分割结果的文件名与图片资源不一致")
-                if image.status in {"success", "needs_confirmation"} and image.mask_path is not None:
+                for mask in image.stored_masks():
                     resolve_mask_path(
-                        self.data_dir, self.object_id, image.asset_id, image.mask_path,
+                        self.data_dir, self.object_id, image.asset_id, mask.mask_path,
                         expected_size=(image.width, image.height),
                         max_pixels=image.width * image.height,
-                        expected_bbox=image.bbox, expected_area_ratio=image.area_ratio,
+                        expected_bbox=mask.bbox, expected_area_ratio=mask.area_ratio,
                     )
-                    retained.add(image.mask_path)
+                    retained.add(mask.mask_path)
         for relative_path in self._created_masks - retained:
             storage_io_path(_path_without_links(self.data_dir, relative_path)).unlink(missing_ok=True)
         self._created_masks.intersection_update(retained)

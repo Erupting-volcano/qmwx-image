@@ -10,6 +10,7 @@ from PIL import Image, UnidentifiedImageError
 from app.models.image_asset import FORMAT_MIME_TYPES
 from app.models.processing_result import ImageMetadata, ImageMetadataData, ProcessingError, ProcessingResult
 from app.modules.base import BaseProcessor, ProcessingContext
+from app.storage.local_storage import _storage_resolved_path, storage_io_path
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ def inspect_image(path: Path, max_pixels: int = 40_000_000) -> dict:
     """Verify file structure, reopen, and decode pixels before accepting an image."""
     if max_pixels <= 0:
         raise InvalidImageError("图片像素限制必须大于零")
+    path = storage_io_path(Path(path))
     try:
         size_bytes = path.stat().st_size
         if size_bytes <= 0:
@@ -75,7 +77,8 @@ class InspectedImage:
 
     def __init__(self, path: Path, max_pixels: int = 40_000_000) -> None:
         try:
-            source = Path(path).resolve()
+            logical_source = _storage_resolved_path(Path(path))
+            source = storage_io_path(logical_source)
             before = self._file_fingerprint(source)
             metadata = inspect_image(source, max_pixels)
             after = self._file_fingerprint(source)
@@ -83,7 +86,7 @@ class InspectedImage:
             raise InvalidImageError("图片无法读取，请重新选择文件") from exc
         if before != after:
             raise InvalidImageError("图片在验证期间发生变化，请重新选择文件")
-        object.__setattr__(self, "_stem_path", source.with_suffix(""))
+        object.__setattr__(self, "_stem_path", logical_source.with_suffix(""))
         object.__setattr__(self, "_fingerprint", after)
         object.__setattr__(self, "_metadata_items", tuple(metadata.items()))
         object.__setattr__(self, "_max_pixels", max_pixels)
@@ -103,8 +106,9 @@ class InspectedImage:
         if max_pixels < self._max_pixels or max_pixels <= 0:
             return None
         try:
-            source = Path(path).resolve()
-            if source.with_suffix("") != self._stem_path:
+            logical_source = _storage_resolved_path(Path(path))
+            source = storage_io_path(logical_source)
+            if logical_source.with_suffix("") != self._stem_path:
                 return None
             if self._file_fingerprint(source) != self._fingerprint:
                 return None

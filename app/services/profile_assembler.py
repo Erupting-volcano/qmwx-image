@@ -9,6 +9,7 @@ from app.models.image_asset import ImageAsset
 from app.models.image_quality import ImageQualityData
 from app.models.object_profile import ObjectProfile
 from app.models.processing_result import ImageMetadataData, ProcessingError, ProcessingResult
+from app.models.segmentation import SegmentationData
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class ProfileAssembler:
         self._adapters: dict[str, _AdapterRegistration] = {
             "image_metadata": _AdapterRegistration(self._merge_image_metadata, editable_images=True),
             "image_quality": _AdapterRegistration(self._validate_image_quality),
+            "object_segmentation": _AdapterRegistration(self._validate_segmentation),
         }
 
     def register_adapter(self, module_name: str, adapter: ProfileAdapter) -> None:
@@ -44,6 +46,22 @@ class ProfileAssembler:
         if object_id is not None:
             fields["object_id"] = object_id
         return ObjectProfile.model_validate(fields)
+
+    @staticmethod
+    def _validate_segmentation(profile: ObjectProfile, result: ProcessingResult) -> ObjectProfile:
+        """Keep segmentation in module history; never turn pixel boxes into measurements."""
+        payload = SegmentationData.model_validate(result.data)
+        known_images = {image.asset_id: image for image in profile.images}
+        if payload.input_count != len(known_images) or {image.asset_id for image in payload.images} != set(known_images):
+            raise ValueError("分割结果必须对应当前档案的全部输入图片")
+        if any(image.filename != known_images[image.asset_id].filename for image in payload.images):
+            raise ValueError("分割结果的文件名与图片资源不一致")
+        for image in payload.images:
+            if image.mask_path is not None:
+                prefix = f"objects/{profile.object_id}/masks/{image.asset_id}_"
+                if not image.mask_path.startswith(prefix):
+                    raise ValueError("分割掩码不属于当前物体或图片")
+        return profile
 
     @staticmethod
     def _validate_image_quality(profile: ObjectProfile, result: ProcessingResult) -> ObjectProfile:
@@ -139,7 +157,9 @@ class ProfileAssembler:
                 accepted_result = ProcessingResult(
                     module_name=accepted_result.module_name,
                     status="failed",
-                    data=accepted_result.data,
+                    # Rejected mask files are discarded by the transaction; do not
+                    # persist their old successful records as usable artifact links.
+                    data={} if accepted_result.module_name == "object_segmentation" else accepted_result.data,
                     warnings=accepted_result.warnings,
                     errors=[*accepted_result.errors, ProcessingError(
                         code="invalid_module_data",

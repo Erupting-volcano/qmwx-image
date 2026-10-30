@@ -9,9 +9,11 @@ from uuid import UUID, uuid4
 from app.config import Settings
 from app.models.image_asset import ImageAsset
 from app.models.object_profile import ObjectProfile
+from app.models.segmentation import NormalizedBox
 from app.modules.base import BaseProcessor
 from app.modules.image_metadata import ImageMetadataProcessor, InspectedImage, InvalidImageError
 from app.modules.image_quality import ImageQualityProcessor
+from app.modules.object_segmentation import ObjectSegmentationProcessor
 from app.services.pipeline import Pipeline
 from app.storage.local_storage import LocalStorage
 
@@ -25,6 +27,7 @@ class ImageInput:
 
     filename: str
     stream: BinaryIO
+    segmentation_box: NormalizedBox | None = None
 
 
 class CollectionError(ValueError):
@@ -57,7 +60,8 @@ class ImageCollectionService:
         self.settings = settings or Settings()
         self.storage = storage or LocalStorage(self.settings.data_dir)
         self.pipeline = pipeline or Pipeline(
-            [ImageMetadataProcessor(), ImageQualityProcessor()] if processors is None else processors
+            [ImageMetadataProcessor(), ImageQualityProcessor(), ObjectSegmentationProcessor(self.settings)]
+            if processors is None else processors
         )
 
     def collect(self, name: str, images: Sequence[ImageInput]) -> ObjectProfile:
@@ -72,13 +76,21 @@ class ImageCollectionService:
         if any(not isinstance(image, ImageInput) or not isinstance(image.filename, str)
                or not callable(getattr(image.stream, "read", None)) for image in images):
             raise CollectionError("invalid_images", "图片输入需要包含文件名和可读取的二进制流。")
+        try:
+            boxes = [NormalizedBox.model_validate(
+                image.segmentation_box.model_dump() if isinstance(image.segmentation_box, NormalizedBox)
+                else image.segmentation_box
+            ) if image.segmentation_box is not None else None for image in images]
+        except (ValueError, TypeError) as exc:
+            raise CollectionError("invalid_segmentation_boxes", "目标框必须是转正后图片中有效的 0–1 比例坐标。") from exc
 
         object_id = uuid4()
         total_bytes = 0
         with self.storage.transaction(object_id) as transaction:
             assets: list[ImageAsset] = []
             inspected_images: dict[UUID, InspectedImage] = {}
-            for image in images:
+            segmentation_boxes: dict[UUID, NormalizedBox] = {}
+            for image, box in zip(images, boxes):
                 asset_id = uuid4()
                 filename = _safe_filename(image.filename)
                 byte_budget = min(self.settings.max_image_bytes,
@@ -102,6 +114,8 @@ class ImageCollectionService:
                     raise CollectionError(exc.code, f"图片“{filename}”：{exc}", exc.status_code) from exc
                 storage_path = transaction.finalize_image(temporary_image, metadata["image_format"])
                 inspected_images[asset_id] = inspection
+                if box is not None:
+                    segmentation_boxes[asset_id] = box
                 assets.append(ImageAsset(
                     asset_id=asset_id, filename=filename,
                     storage_path=storage_path,
@@ -113,7 +127,8 @@ class ImageCollectionService:
             initial = self.pipeline.assembler.create_profile(name, assets, object_id=object_id)
             profile = self.pipeline.run(initial, transaction.data_dir,
                                         max_image_pixels=self.settings.max_image_pixels,
-                                        inspected_images=inspected_images)
+                                        inspected_images=inspected_images,
+                                        segmentation_boxes=segmentation_boxes, artifact_store=transaction)
             payload = transaction.save_profile(profile)
             transaction.commit()
         logger.info("Image collection %s saved: %s images, status=%s", object_id, len(assets), profile.status)

@@ -52,7 +52,9 @@ def test_default_upload_runs_real_quality_and_round_trips(client, settings, imag
     )
     assert response.status_code == 201, response.text
     profile = response.json()["profile"]
-    assert [result["module_name"] for result in profile["processing_results"]] == ["image_metadata", "image_quality"]
+    assert [result["module_name"] for result in profile["processing_results"]] == [
+        "image_metadata", "image_quality", "object_segmentation",
+    ]
     result = quality_result(profile)
     data = ImageQualityData.model_validate(result["data"])
     assert result["status"] == "success"
@@ -65,7 +67,9 @@ def test_default_upload_runs_real_quality_and_round_trips(client, settings, imag
     assert 100 < checked.mean_luminance < 155
     assert checked.contrast_stddev > 40
     assert checked.edge_strength > 4
-    assert profile["status"] == "completed"
+    assert profile["status"] == "completed_with_warnings"
+    assert profile["processing_results"][-1]["status"] == "skipped"
+    assert profile["processing_results"][-1]["data"]["images"][0]["status"] == "disabled"
     assert profile["schema_version"] == "0.1.0"
     assert profile["measurements"][0]["value"] is None
     assert profile["geometry"]["scale_status"] == "uncalibrated"
@@ -113,7 +117,9 @@ def test_default_collection_reuses_validation_and_custom_processors_stay_support
     service = ImageCollectionService(settings)
     profile = service.collect("直接采集", [ImageInput("texture.png", BytesIO(detailed_image()))])
     assert len(calls) == 1
-    assert [result.module_name for result in profile.processing_results] == ["image_metadata", "image_quality"]
+    assert [result.module_name for result in profile.processing_results] == [
+        "image_metadata", "image_quality", "object_segmentation",
+    ]
     assert service.get_profile(profile.object_id) == profile
 
     custom = ImageCollectionService(settings, processors=[ImageMetadataProcessor()])

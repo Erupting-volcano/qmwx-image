@@ -15,6 +15,13 @@ def _env_int(name: str, default: int) -> int:
     return value
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, str(default)).strip().lower()
+    if value not in {"true", "false", "1", "0"}:
+        raise ValueError(f"{name} must be true/false or 1/0")
+    return value in {"true", "1"}
+
+
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path = field(default_factory=lambda: Path(
@@ -30,6 +37,14 @@ class Settings:
     max_image_pixels: int = field(default_factory=lambda: _env_int(
         "DIGITIZER_MAX_IMAGE_PIXELS", 40_000_000
     ))
+    segmentation_enabled: bool = field(default_factory=lambda: _env_bool("DIGITIZER_SEGMENTATION_ENABLED"))
+    segmentation_checkpoint: Path | None = field(default_factory=lambda: (
+        Path(os.environ["DIGITIZER_SEGMENTATION_CHECKPOINT"])
+        if os.environ.get("DIGITIZER_SEGMENTATION_CHECKPOINT", "").strip() else None
+    ))
+    segmentation_device: str = field(default_factory=lambda: os.environ.get(
+        "DIGITIZER_SEGMENTATION_DEVICE", "cpu"
+    ).strip().lower())
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data_dir", Path(self.data_dir).expanduser().resolve())
@@ -37,3 +52,10 @@ class Settings:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.segmentation_enabled, bool):
+            raise ValueError("segmentation_enabled must be a boolean")
+        if self.segmentation_device not in {"cpu", "cuda"}:
+            raise ValueError("segmentation_device must be cpu or cuda")
+        if self.segmentation_checkpoint is not None:
+            object.__setattr__(self, "segmentation_checkpoint",
+                               Path(self.segmentation_checkpoint).expanduser().resolve())

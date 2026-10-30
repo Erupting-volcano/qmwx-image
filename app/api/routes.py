@@ -1,5 +1,6 @@
 """Thin HTTP layer: receive input, call the application service, return saved data."""
 
+import json
 import logging
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
@@ -15,8 +16,9 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from app.config import PROJECT_ROOT, Settings
 from app.models.object_profile import ObjectProfile
+from app.models.segmentation import NormalizedBox, SegmentationData
 from app.services.image_collection import CollectionError, ImageInput
-from app.storage.local_storage import CorruptProfileError, ProfileNotFoundError
+from app.storage.local_storage import CorruptProfileError, ProfileNotFoundError, resolve_mask_path, resolve_original_path
 
 
 logger = logging.getLogger(__name__)
@@ -87,14 +89,48 @@ def health() -> dict:
 def public_config(request: Request) -> dict:
     settings: Settings = request.app.state.settings
     return {"max_files": settings.max_files, "max_image_bytes": settings.max_image_bytes,
-            "max_total_bytes": settings.max_total_bytes, "max_image_pixels": settings.max_image_pixels}
+            "max_total_bytes": settings.max_total_bytes, "max_image_pixels": settings.max_image_pixels,
+            "segmentation_enabled": settings.segmentation_enabled,
+            "segmentation_prompt_type": "box", "segmentation_model": "sam2.1_hiera_tiny"}
+
+
+def _parse_segmentation_boxes(values: list, image_count: int) -> list[NormalizedBox | None]:
+    if not values:
+        return [None] * image_count
+    try:
+        if len(values) != 1 or not isinstance(values[0], str):
+            raise ValueError("Expected one JSON field")
+        payload = json.loads(values[0])
+        if not isinstance(payload, list) or len(payload) != image_count:
+            raise ValueError("Image count mismatch")
+        boxes = []
+        for value in payload:
+            if value is None:
+                boxes.append(None)
+            else:
+                if not isinstance(value, list) or len(value) != 4:
+                    raise ValueError("Expected four coordinates")
+                boxes.append(NormalizedBox(x0=value[0], y0=value[1], x1=value[2], y1=value[3]))
+        return boxes
+    except (ValueError, TypeError) as exc:
+        raise api_error(422, "invalid_segmentation_boxes",
+                        "目标框需与图片顺序一一对应，使用 null 或 [左, 上, 右, 下] 的有效 0–1 比例坐标。") from exc
 
 
 @router.post("/api/v1/objects", status_code=201, response_model=CreateObjectResponse,
-             openapi_extra={"requestBody": {"required": True, "content": {
-                 "multipart/form-data": {"schema": {"type": "object", "required": ["name", "images"],
-                     "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 120},
-                                    "images": {"type": "array", "items": {"type": "string", "format": "binary"}}}}}}}})
+             openapi_extra={
+                 "requestBody": {"required": True, "content": {
+                     "multipart/form-data": {"schema": {
+                         "type": "object", "required": ["name", "images"],
+                         "properties": {
+                             "name": {"type": "string", "minLength": 1, "maxLength": 120},
+                             "images": {"type": "array", "items": {"type": "string", "format": "binary"}},
+                             "segmentation_boxes": {"type": "string", "description":
+                                 "可选JSON数组，与图片顺序一致，每项null或EXIF转正后[x0,y0,x1,y1]比例坐标"},
+                         },
+                     }},
+                 }},
+             })
 async def create_object(request: Request) -> dict:
     settings: Settings = request.app.state.settings
     if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "multipart/form-data":
@@ -103,7 +139,7 @@ async def create_object(request: Request) -> dict:
     await run_in_threadpool(spool_dir.mkdir, parents=True, exist_ok=True)
     try:
         parser = LocalMultipartParser(request.headers, request.stream(), spool_dir=spool_dir,
-                                      max_files=settings.max_files, max_fields=1, max_part_size=4096)
+                                      max_files=settings.max_files, max_fields=2, max_part_size=4096)
         form = await parser.parse()
     except MultiPartException as exc:
         if exc.message == BODY_LIMIT_MARKER:
@@ -112,13 +148,14 @@ async def create_object(request: Request) -> dict:
     try:
         names = form.getlist("name")
         uploads = form.getlist("images")
-        if set(form.keys()) - {"name", "images"}:
-            raise api_error(422, "invalid_upload_form", "表单只接受物体名称和图片。")
+        if set(form.keys()) - {"name", "images", "segmentation_boxes"}:
+            raise api_error(422, "invalid_upload_form", "表单只接受物体名称、图片和可选目标框。")
         if len(names) != 1 or not isinstance(names[0], str):
             raise api_error(422, "invalid_name", "请填写一个物体名称。")
         if any(not isinstance(upload, UploadFile) for upload in uploads):
             raise api_error(422, "invalid_images", f"请选择 1–{settings.max_files} 张图片。")
-        images = [ImageInput(upload.filename or "image", upload.file) for upload in uploads]
+        boxes = _parse_segmentation_boxes(form.getlist("segmentation_boxes"), len(uploads))
+        images = [ImageInput(upload.filename or "image", upload.file, box) for upload, box in zip(uploads, boxes)]
         try:
             profile = await run_in_threadpool(request.app.state.collection_service.collect, names[0], images)
         except CollectionError as exc:
@@ -152,3 +189,45 @@ async def download_profile(request: Request, object_id: UUID) -> Response:
         "Content-Disposition": f'attachment; filename="{object_id}-profile.json"',
         "X-Content-Type-Options": "nosniff",
     })
+
+
+@router.get("/api/v1/objects/{object_id}/images/{asset_id}/original")
+async def preview_original(request: Request, object_id: UUID, asset_id: UUID) -> FileResponse:
+    profile, _ = await _read_profile(request, object_id)
+    asset = next((image for image in profile.images if image.asset_id == asset_id), None)
+    if asset is None:
+        raise api_error(404, "image_not_found", "此物体档案中没有该图片。")
+    try:
+        path = await run_in_threadpool(resolve_original_path, request.app.state.storage.data_dir,
+                                       object_id, asset_id, asset.storage_path)
+    except (ValueError, TypeError, OSError) as exc:
+        raise api_error(404, "image_not_found", "图片文件不可用。") from exc
+    return FileResponse(path, media_type=asset.mime_type,
+                        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
+
+
+@router.get("/api/v1/objects/{object_id}/images/{asset_id}/mask")
+async def preview_mask(request: Request, object_id: UUID, asset_id: UUID) -> FileResponse:
+    profile, _ = await _read_profile(request, object_id)
+    if not any(image.asset_id == asset_id for image in profile.images):
+        raise api_error(404, "mask_not_found", "此物体档案中没有该图片。")
+    for result in reversed(profile.processing_results):
+        if result.module_name != "object_segmentation":
+            continue
+        if result.status not in {"success", "partial"}:
+            break
+        try:
+            payload = SegmentationData.model_validate(result.data)
+            record = next((image for image in payload.images if image.asset_id == asset_id), None)
+            if record is None or record.mask_path is None or record.status not in {"success", "needs_confirmation"}:
+                break
+            path = await run_in_threadpool(
+                resolve_mask_path, request.app.state.storage.data_dir, object_id, asset_id, record.mask_path,
+                expected_size=(record.width, record.height), max_pixels=request.app.state.settings.max_image_pixels,
+                expected_bbox=record.bbox, expected_area_ratio=record.area_ratio,
+            )
+        except (ValueError, TypeError, OSError):
+            break
+        return FileResponse(path, media_type="image/png",
+                            headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
+    raise api_error(404, "mask_not_found", "此图片没有可预览的有效分割掩码。")

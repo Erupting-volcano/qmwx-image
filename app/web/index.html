@@ -30,7 +30,7 @@
             <span class="note-symbol" aria-hidden="true">i</span>
             <div>
               <h2 id="scope-title">当前模块的处理范围</h2>
-              <p>当前提取图片基础信息，并对分辨率、亮度、对比度与细节响应做启发式筛查。物体类别、真实尺寸、材质与 3D 模型仍为未知。</p>
+              <p>当前提取基础信息、筛查图像质量，并支持配置模型后的框选分割。需要人工选择目标范围；物体类别、真实尺寸、材质与 3D 模型仍为未知。</p>
             </div>
           </aside>
         </section>
@@ -58,6 +58,7 @@
                 <input id="image-input" name="images" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" multiple aria-describedby="upload-hint" />
               </div>
               <p id="upload-hint" class="field-hint upload-hint">最多 20 张，合计不超过 100 MiB。手机 HEIC / HEIF 照片需先转换为 JPEG、PNG 或 WebP。</p>
+              <p id="segmentation-config-note" class="segmentation-config-note">可选：选图后展开每张照片并框选目标。分割需要配置并启用本地模型；物体名称不会自动定位目标，未启用时仍可建立基础档案。</p>
 
               <div id="file-list" class="file-list" aria-label="已选择的图片"></div>
               <div id="selection-actions" class="selection-actions" hidden><button id="clear-files" type="button" class="text-button">清空已选照片</button><p>可继续添加其他视角的照片</p></div>
@@ -84,6 +85,12 @@
               <p id="quality-summary" class="quality-summary"></p>
               <p class="quality-note">质量筛查仅供拍摄复查：低细节响应也可能来自平滑表面，并非可靠的模糊诊断。未发现明显问题不代表照片适合三维重建，也不代表尺寸信息可信。</p>
               <ul id="quality-images" class="quality-images"></ul>
+            </section>
+            <section class="segmentation-section" aria-labelledby="segmentation-title">
+              <h4 id="segmentation-title">物体定位与前景分割</h4>
+              <p id="segmentation-summary" class="quality-summary"></p>
+              <p class="quality-note">目标由上传前的人工矩形框指定，掩码由 SAM 2.1 模型生成。请核对是否选中了正确物体；候选分数不能证明目标正确，分割也不提供真实尺寸。</p>
+              <ul id="segmentation-images" class="segmentation-images"></ul>
             </section>
             <section id="warnings-section" class="warnings-section" hidden><h4>处理提示</h4><ul id="warnings-list"></ul></section>
             <details class="json-details"><summary>查看完整档案 JSON <span>结构化原始记录</span></summary><pre id="profile-json" tabindex="0" aria-label="完整档案 JSON"></pre></details>

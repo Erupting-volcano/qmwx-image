@@ -11,7 +11,7 @@
     "result-section", "result-status", "result-announcement", "profile-name", "profile-id",
     "profile-facts", "result-images", "missing-information", "warnings-section",
     "warnings-list", "profile-json", "view-json", "download-json", "drop-description", "upload-hint",
-    "quality-summary", "quality-images",
+    "quality-summary", "quality-images", "segmentation-config-note", "segmentation-summary", "segmentation-images",
   ].map((id) => [id, document.getElementById(id)]));
 
   let selectedFiles = [];
@@ -51,6 +51,11 @@
         hint += `单张解码后不超过 ${new Intl.NumberFormat("zh-CN").format(config.max_image_pixels)} 像素。`;
       }
       elements["upload-hint"].textContent = `${hint}手机 HEIC / HEIF 照片需先转换为 JPEG、PNG 或 WebP。`;
+      if (typeof config.segmentation_enabled === "boolean") {
+        elements["segmentation-config-note"].textContent = config.segmentation_enabled
+          ? "框选分割已启用：展开每张照片并拖出目标范围，再建立档案。服务端仍会检查模型依赖和权重；物体名称不会自动定位目标。"
+          : "分割当前未启用：照片与质量评估仍可正常保存。可先框选目标，但需要管理员配置并启用模型后，才会生成掩码。";
+      }
       renderFiles();
     } catch {
       // The form remains usable with the default limits; the server validates every upload.
@@ -72,6 +77,96 @@
     elements["upload-form"].setAttribute("aria-busy", String(busy || isReadingFiles));
   }
 
+  function makeTargetSelector(entry) {
+    const details = createNode("details", "target-selector");
+    const summary = createNode("summary", "", "框选分割目标（可选）");
+    details.append(summary);
+    if (!entry.objectUrl) {
+      details.append(createNode("p", "target-help", "当前照片无法预览，不能框选目标；服务器仍会验证照片。"));
+      return details;
+    }
+    details.append(createNode("p", "target-help", "在下图拖出一个矩形，包住要分割的物体。矩形只提供大致位置，最终掩码由模型生成；不会按名称自动定位。"));
+    const surface = createNode("div", "target-surface");
+    const image = createNode("img", "target-image");
+    image.src = entry.objectUrl;
+    image.alt = `框选目标预览：${entry.file.name}`;
+    image.draggable = false;
+    const rectangle = createNode("span", "target-rectangle");
+    rectangle.setAttribute("aria-hidden", "true");
+    const status = createNode("p", "target-status");
+    status.setAttribute("role", "status");
+    const clear = createNode("button", "text-button target-clear", "清除目标框");
+    clear.type = "button";
+    clear.setAttribute("aria-label", `清除目标框：${entry.file.name}`);
+    let gesture = null;
+
+    function showBox(box) {
+      summary.textContent = entry.segmentationBox ? "已框选分割目标（展开可重画）" : "框选分割目标（可选）";
+      rectangle.hidden = !box;
+      if (box) {
+        rectangle.setAttribute("style", `left:${box[0] * 100}%;top:${box[1] * 100}%;width:${(box[2] - box[0]) * 100}%;height:${(box[3] - box[1]) * 100}%`);
+      }
+      status.textContent = entry.segmentationBox
+        ? `已框选目标：左上 ${Math.round(entry.segmentationBox[0] * 100)}%、${Math.round(entry.segmentationBox[1] * 100)}%，右下 ${Math.round(entry.segmentationBox[2] * 100)}%、${Math.round(entry.segmentationBox[3] * 100)}%。再次拖动可重画。`
+        : "尚未框选；启用模型后，需要先框选才能分割这张图片。";
+      clear.disabled = !entry.segmentationBox;
+    }
+    function position(event) {
+      const bounds = image.getBoundingClientRect();
+      if (!(bounds.width > 0 && bounds.height > 0) || !Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) return null;
+      return [Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
+        Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height))];
+    }
+    function boxBetween(first, second) {
+      return [Math.min(first[0], second[0]), Math.min(first[1], second[1]),
+        Math.max(first[0], second[0]), Math.max(first[1], second[1])];
+    }
+    surface.addEventListener("pointerdown", (event) => {
+      if (isBusy || isReadingFiles || event.isPrimary === false || (event.button !== undefined && event.button !== 0)) return;
+      const point = position(event);
+      if (!point) return;
+      event.preventDefault();
+      gesture = { pointerId: event.pointerId, start: point, previous: entry.segmentationBox };
+      surface.setPointerCapture?.(event.pointerId);
+      showBox(boxBetween(point, point));
+    });
+    surface.addEventListener("pointermove", (event) => {
+      if (!gesture || event.pointerId !== gesture.pointerId || isBusy || isReadingFiles) return;
+      const point = position(event);
+      if (point) { event.preventDefault(); showBox(boxBetween(gesture.start, point)); }
+    });
+    surface.addEventListener("pointerup", (event) => {
+      if (!gesture || event.pointerId !== gesture.pointerId) return;
+      event.preventDefault();
+      const point = position(event);
+      const candidate = point ? boxBetween(gesture.start, point) : null;
+      const bounds = image.getBoundingClientRect();
+      if (!isBusy && !isReadingFiles && candidate && (candidate[2] - candidate[0]) * bounds.width >= 4 && (candidate[3] - candidate[1]) * bounds.height >= 4) {
+        entry.segmentationBox = candidate;
+      } else {
+        entry.segmentationBox = gesture.previous;
+      }
+      gesture = null;
+      if (surface.hasPointerCapture?.(event.pointerId)) surface.releasePointerCapture(event.pointerId);
+      showBox(entry.segmentationBox);
+    });
+    surface.addEventListener("pointercancel", () => {
+      if (gesture) entry.segmentationBox = gesture.previous;
+      gesture = null;
+      showBox(entry.segmentationBox);
+    });
+    clear.addEventListener("click", () => {
+      if (isBusy || isReadingFiles) return;
+      gesture = null;
+      entry.segmentationBox = null;
+      showBox(null);
+    });
+    surface.append(image, rectangle);
+    details.append(surface, status, clear);
+    showBox(entry.segmentationBox);
+    return details;
+  }
+
   function renderFiles() {
     elements["file-list"].replaceChildren();
     selectedFiles.forEach((entry) => {
@@ -91,6 +186,7 @@
         : "由服务器验证图片内容";
       copy.append(name, createNode("span", "file-meta", `${formatBytes(entry.file.size)} · ${dimensions}`));
       const remove = createNode("button", "remove-file", "×");
+      remove.id = `remove-file-${entry.id}`;
       remove.type = "button";
       remove.setAttribute("aria-label", `移除照片：${entry.file.name}`);
       remove.addEventListener("click", () => {
@@ -102,14 +198,12 @@
         renderFiles();
         showError("");
         if (nextEntry) {
-          const buttons = elements["file-list"].querySelectorAll("button");
-          const nextIndex = selectedFiles.findIndex((file) => file.id === nextEntry.id);
-          buttons[nextIndex]?.focus();
+          document.getElementById(`remove-file-${nextEntry.id}`)?.focus();
         } else {
           elements["image-input"].focus();
         }
       });
-      item.append(preview, copy, remove);
+      item.append(preview, copy, remove, makeTargetSelector(entry));
       elements["file-list"].append(item);
     });
     const totalBytes = selectedFiles.reduce((total, entry) => total + entry.file.size, 0);
@@ -138,6 +232,7 @@
           objectUrl: dimensions ? objectUrl : null,
           width: dimensions?.width,
           height: dimensions?.height,
+          segmentationBox: null,
         });
       }
       image.onload = () => finish({ width: image.naturalWidth, height: image.naturalHeight });
@@ -298,6 +393,94 @@
     if (!images.length) elements["quality-images"].append(createNode("li", "quality-note", "暂无可评估的图片记录。"));
   }
 
+  function renderSegmentation(profile, images, objectId) {
+    const results = Array.isArray(profile.processing_results) ? profile.processing_results : [];
+    const result = [...results].reverse().find((item) => item?.module_name === "object_segmentation");
+    const records = Array.isArray(result?.data?.images) ? result.data.images : [];
+    const byId = new Map(records.filter((item) => typeof item?.asset_id === "string").map((item) => [item.asset_id, item]));
+    const maskStatuses = new Set(["success", "needs_confirmation"]);
+    const canShowMask = ["success", "partial", "needs_input"].includes(result?.status);
+    const labels = { success: "分割成功", needs_confirmation: "需要人工确认", not_found: "未找到有效目标",
+      failed: "分割失败", disabled: "未启用", unavailable: "模型不可用", needs_input: "需要框选目标" };
+    const known = images.map((asset) => byId.get(asset.asset_id)).filter(Boolean);
+    const succeeded = canShowMask ? known.filter((item) => item.status === "success").length : 0;
+    const review = canShowMask ? known.filter((item) => item.status === "needs_confirmation").length : 0;
+    const failed = known.filter((item) => ["failed", "not_found"].includes(item.status)
+      || (!canShowMask && maskStatuses.has(item.status))).length;
+    elements["segmentation-summary"].textContent = result
+      ? `共 ${images.length} 张图片，分割成功 ${succeeded} 张，待人工确认 ${review} 张，失败或未找到目标 ${failed} 张。未执行或失败的原因见各图说明。`
+      : "本份档案未执行物体分割；没有掩码不代表没有物体。";
+    elements["segmentation-images"].replaceChildren();
+    images.forEach((asset, index) => {
+      const record = byId.get(asset.asset_id);
+      const accepted = record && (canShowMask || !maskStatuses.has(record.status));
+      const status = accepted ? record.status : result ? "failed" : null;
+      const item = createNode("li", "segmentation-image");
+      const header = createNode("div", "quality-image-heading");
+      header.append(createNode("h5", "quality-image-name", `${String(index + 1).padStart(2, "0")}  ${asset.filename || "未命名图片"}`),
+        createNode("span", "quality-badge is-review", labels[status] || (result ? "分割未完成" : "未执行")));
+      item.append(header);
+      if (accepted && typeof record.model_name === "string") {
+        const prompt = record.prompt_type === "box" ? "人工矩形框" : "未提供目标框";
+        item.append(createNode("p", "segmentation-metrics", `模型：${record.model_name} · 提示方式：${prompt}；目标位置不由名称自动识别。`));
+      }
+      if (accepted && Number.isFinite(record.width) && Number.isFinite(record.height)) {
+        item.append(createNode("p", "segmentation-metrics", `分割坐标图 ${record.width} × ${record.height} px（按 EXIF 转正）。`));
+      }
+      if (accepted && Array.isArray(record.bbox) && record.bbox.length === 4 && record.bbox.every(Number.isFinite)) {
+        item.append(createNode("p", "segmentation-metrics", `边界框 [${record.bbox.join(", ")}] px（左上包含、右下不包含；EXIF 转正坐标）。`));
+      }
+      if (accepted && Number.isFinite(record.area_ratio)) {
+        item.append(createNode("p", "segmentation-metrics", `前景面积占比 ${(record.area_ratio * 100).toFixed(2)}%。`));
+      }
+      if (accepted && Number.isFinite(record.confidence)) {
+        item.append(createNode("p", "segmentation-metrics", `模型候选分数 ${record.confidence.toFixed(3)}；分数不是目标正确的概率。`));
+      }
+      const warnings = accepted && Array.isArray(record.warnings) ? record.warnings.filter((value) => typeof value === "string") : [];
+      if (warnings.length) {
+        const list = createNode("ul", "quality-suggestions");
+        warnings.forEach((warning) => list.append(createNode("li", "", warning)));
+        item.append(list);
+      }
+      if (!accepted) item.append(createNode("p", "quality-issues", result
+        ? "本次分割结果不可用；原图与其他有效处理信息仍已保存。" : "本次处理没有此图片的分割结果。"));
+      if (accepted && status === "needs_input") item.append(createNode("p", "quality-issues", "请在上传前展开照片，在目标四周拖出矩形，再建立档案。"));
+      if (accepted && status === "disabled") item.append(createNode("p", "quality-issues", "后台未启用分割；不会生成掩码，图片采集和质量评估不受影响。"));
+      if (accepted && status === "unavailable") item.append(createNode("p", "quality-issues", "分割模型不可用，请管理员检查可选依赖、设备和本地权重配置。"));
+      if (accepted && typeof record.error_id === "string") item.append(createNode("p", "segmentation-metrics", `错误编号：${record.error_id}`));
+
+      if (typeof objectId === "string" && typeof asset.asset_id === "string") {
+        const base = `/api/v1/objects/${encodeURIComponent(objectId)}/images/${encodeURIComponent(asset.asset_id)}`;
+        const previews = createNode("div", "segmentation-previews");
+        const original = createNode("figure");
+        const image = createNode("img", "segmentation-preview");
+        image.src = `${base}/original`;
+        image.alt = `原图：${asset.filename || "未命名图片"}`;
+        image.loading = "lazy";
+        original.append(image, createNode("figcaption", "", "原图（按 EXIF 方向显示）"));
+        previews.append(original);
+        if (canShowMask && accepted && maskStatuses.has(status) && typeof record.mask_path === "string") {
+          const maskFigure = createNode("figure");
+          const mask = createNode("img", "segmentation-preview segmentation-mask");
+          mask.src = `${base}/mask`;
+          mask.alt = `分割掩码：${asset.filename || "未命名图片"}`;
+          mask.loading = "lazy";
+          const link = createNode("a", "", "查看掩码 PNG");
+          link.href = `${base}/mask`;
+          link.target = "_blank";
+          link.rel = "noopener";
+          const caption = createNode("figcaption", "", "白色为前景，黑色为背景。 ");
+          caption.append(link);
+          maskFigure.append(mask, caption);
+          previews.append(maskFigure);
+        }
+        item.append(previews);
+      }
+      elements["segmentation-images"].append(item);
+    });
+    if (!images.length) elements["segmentation-images"].append(createNode("li", "quality-note", "暂无可分割的图片记录。"));
+  }
+
   function renderResult(payload) {
     const profile = payload.profile;
     const objectId = payload.object_id;
@@ -345,6 +528,7 @@
     });
     if (!images.length) elements["result-images"].append(createNode("li", "result-image-meta", "暂无可用图片记录"));
     renderQuality(profile, images);
+    renderSegmentation(profile, images, objectId);
 
     elements["missing-information"].replaceChildren();
     let missing = profile.missing_information;
@@ -431,8 +615,11 @@
     const formData = new FormData();
     formData.append("name", name);
     selectedFiles.forEach((entry) => formData.append("images", entry.file, entry.file.name));
+    if (selectedFiles.some((entry) => entry.segmentationBox)) {
+      formData.append("segmentation_boxes", JSON.stringify(selectedFiles.map((entry) => entry.segmentationBox)));
+    }
     setBusy(true);
-    elements["upload-status"].textContent = "正在上传、提取基础信息并评估图像质量，请保持页面打开…";
+    elements["upload-status"].textContent = "正在上传、评估图像质量并处理已配置的分割任务，请保持页面打开…";
     try {
       const response = await fetch("/api/v1/objects", { method: "POST", body: formData, headers: { Accept: "application/json" } });
       let payload;

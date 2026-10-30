@@ -1,4 +1,5 @@
 .venv/
+.venv-seg/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -8,3 +9,7 @@ htmlcov/
 data/*
 !data/.gitkeep
 *.log
+weights/
+*.pt
+*.pth
+*.safetensors

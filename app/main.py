@@ -64,7 +64,7 @@ def create_app(settings: Settings | None = None,
     settings = settings or Settings()
     collection_service = ImageCollectionService(settings, processors, pipeline=pipeline)
     application = FastAPI(title="其命维新 · 物体信息输入与数字化模块", version="0.1.0",
-                          description="旧物改造主项目的基础模块：图片输入、基础元数据、图像质量启发式筛查和统一档案输出。")
+                          description="旧物改造主项目的基础模块：图片输入、元数据、质量筛查及可选的人工框选前景分割。")
     application.state.settings = settings
     application.state.storage = collection_service.storage
     application.state.collection_service = collection_service

@@ -1,10 +1,10 @@
 # 其命维新——物体信息输入与数字化模块 V0.1
 
-这是旧物改造辅助项目「其命维新」的物体信息输入与数字化模块，为后续改造方案生成、几何约束验证和操作规划提供标准化物体档案。V0.1 负责图片采集、合法性检查、基础元数据、图像质量启发式筛查和统一数据输出。它使用 Python、Pydantic 和 Pillow；FastAPI 与中文页面是可独立启动的接入适配层和调试入口。
+这是旧物改造辅助项目「其命维新」的物体信息输入与数字化模块，为后续改造方案生成、几何约束验证和操作规划提供标准化物体档案。V0.1 负责图片采集、合法性检查、基础元数据、图像质量筛查和统一数据输出，并提供可选的 SAM 2.1 Tiny 框选前景分割。基础环境使用 Python、Pydantic 和 Pillow；模型依赖单独安装，FastAPI 与中文页面是接入适配层和调试入口。
 
-处理流程：**多图输入 → 限量写入并计算校验值 → 实际解码验证 → 元数据模块 → 图像质量筛查 → 统一档案组装与校验 → 原子保存 → 向主项目返回结构化数据**。
+处理流程：**多图输入 → 限量写入与验证 → 元数据模块 → 图像质量筛查 → 可选框选分割 → 统一档案校验 → 原子保存**。默认模块顺序为 `ImageMetadataProcessor → ImageQualityProcessor → ObjectSegmentationProcessor`。
 
-当前真实能力包括图片格式、宽度、高度和文件大小提取，以及分辨率、亮度、对比度和边缘细节响应筛查。没有接入 AI 识别、材料识别、尺寸估计、三维重建或 CAD 建模；这些结果保持明确的未知值。没有标尺或相机标定时，不会根据照片虚构物体尺寸。“高精度”是后续算法与校准工作的目标，不是 V0.1 的精度承诺。
+当前能力包括基础图片信息、质量筛查，以及配置好可选依赖和本地权重后的模型分割。分割默认未启用；需要用户在照片上框选目标，不会按物体名称自动定位。没有接入物体类别识别、材料识别、尺寸估计、三维重建或 CAD 建模；这些结果仍为未知。没有标尺或相机标定时，不会虚构物体尺寸。“高精度”是后续目标，不是 V0.1 的精度承诺。
 
 ## 接入主项目
 
@@ -43,6 +43,8 @@ except CollectionError as error:
 - Python 3.11 或更高兼容版本。
 - Windows PowerShell；其他系统使用对应的虚拟环境 Python 路径即可。
 - 不需要 Node.js、数据库、GPU、Docker 或外部 AI 服务。
+
+以上为基础上传与质量评估环境。可选模型分割另外需要 PyTorch、SAM 2 与手动取得的 Tiny 权重；安装与配置见[分割模块说明](docs/segmentation.md)，不会随基础安装自动下载。
 
 在项目目录执行：
 
@@ -94,6 +96,8 @@ python -m venv .venv
 | `POST /api/v1/objects` | 上传图片、执行模块并创建档案 | `201`，含 `object_id`、`status`、`profile` |
 | `GET /api/v1/objects/{object_id}` | 读取完整档案 | `200`，ObjectProfile JSON |
 | `GET /api/v1/objects/{object_id}/profile.json` | 下载档案 | `200`，JSON 附件 |
+| `GET /api/v1/objects/{object_id}/images/{asset_id}/original` | 按档案和图片 ID 安全预览原图 | `200`，原图片 |
+| `GET /api/v1/objects/{object_id}/images/{asset_id}/mask` | 预览最新有效分割掩码 | `200`，二值 PNG；不可用时 `404` |
 
 上传使用 `multipart/form-data`，名称字段为 `name`，每张图片使用同名的 `images` 字段：
 
@@ -162,6 +166,9 @@ app/
   models/                         Pydantic 统一数据契约
   modules/base.py                 模块接口与处理上下文
   modules/image_metadata.py       真实图片元数据提取
+  modules/image_quality.py        图像质量启发式筛查
+  modules/object_segmentation.py  可选的框选前景分割
+  modules/sam2_backend.py         延迟加载的官方 SAM 2.1 Tiny 接口
   services/pipeline.py            顺序执行、异常隔离和结果交接
   services/profile_assembler.py   类型校验、适配器合并与缺失信息整理
   services/image_collection.py    主项目可直接调用的收集服务与输入接口
@@ -176,6 +183,7 @@ data/                             默认数据目录，实际生成文件不纳�
 ```text
 data/objects/{object_id}/
   images/{asset_id}.png            扩展名按实际解码格式确定
+  masks/{asset_id}_{artifact_id}.png  可选的转正后二值分割掩码
   profile.json                    包含模块结果的完整档案
 ```
 
@@ -209,6 +217,16 @@ HTTP 解析器目前在图片超过 1 MiB 时将上传流写入磁盘，然后�
 原始宽高保留编码方向，分析图宽高按 EXIF 转正后的方向记录。普通 16 位灰度 PNG 会映射到 0–255；16 位灰度同时带透明色的 PNG 暂不支持质量评估，会明确记录该图评估未完成，避免 Pillow 转换造成错误曝光结论。这不会拒绝保存已经通过合法性验证的原图，也不会阻止其他图片评估。
 
 这是启发式筛查，不是可靠的模糊诊断。整图平均指标可能遗漏局部过曝、局部模糊或物体过小，也会受背景、噪声及平滑表面影响。`good` 不保证适合三维重建，更不证明物体尺寸可信。Pillow 的缩略和方向处理行为见 [Image 文档](https://pillow.readthedocs.io/en/stable/reference/Image.html#PIL.Image.Image.thumbnail)与 [ImageOps 文档](https://pillow.readthedocs.io/en/stable/reference/ImageOps.html#PIL.ImageOps.exif_transpose)。
+
+## 物体定位与前景分割
+
+本版仅接入 **SAM 2.1 Hiera Tiny + 人工矩形框提示**。用户上传前展开每张照片，框住目标，再建立档案；矩形只给出大致位置，像素掩码必须由模型生成。框坐标按 EXIF 转正后的显示图片归一化，后端转为对应原图像素坐标。结果页并排显示原图、黑白掩码、状态、边界框、面积比例及中文提示。
+
+默认未启用，未配置模型时不会假装成功；上传、元数据和质量评估仍正常保存。未启用或不可用会产生明确的未执行状态与说明，档案通常为 `completed_with_warnings`。没有模型依赖时可以正常启动；配置启用、有框且权重可用时才延迟加载，同一处理器缓存一个模型实例。
+
+分割结果保存在 `processing_results.object_segmentation`（按 `module_name` 查找），不增加档案顶层字段，也不改变版本。掩码是与 EXIF 转正原图同尺寸的独立 `L` PNG，`255` 为前景、`0` 为背景；文件随原图和 JSON 一起暂存、提交或回滚，不把像素矩阵放进 JSON。全图、极小面积及低质量分数需人工确认，空掩码不保存。SAM 的候选分数不是目标身份正确率，任何结果都需检查是否覆盖选中的物体。
+
+选型依据、许可证、可选 CPU/Windows 安装、权重校验、配置变量、API 提示格式、坐标与状态契约、测试范围见[分割模块说明](docs/segmentation.md)。本轮未安装大型依赖或下载权重，因此尚未完成真实模型推理和真实照片效果验收。
 
 ## 添加处理模块
 
@@ -262,7 +280,7 @@ pipeline = Pipeline(
 
 Python 集成时使用 `ImageCollectionService(pipeline=pipeline)`；HTTP 集成时使用 `create_app(pipeline=pipeline)` 创建应用，接口和网页无需修改。需要新档案字段时，在对应统一模型中显式定义类型；仅产生模块专属结果时，可以保存在该模块经过验证的 `data` 中。适配器收到档案副本，最终输出还会统一校验，禁止替换物体身份、原始图片和创建时间等受保护字段。
 
-无适配器的模块仍会保留标准化的模块结果，不会把任意字典自动写入物体档案顶层。内置 `image_metadata` 和 `image_quality` 均有专用输出模型和适配器，通过 `asset_id` 对应每张图片；质量适配器只检查数据与资源归属，不改写图片或物体事实。显式传入 `processors` 或 `pipeline` 时仍完全采用调用方配置，不自动追加默认模块。
+无适配器的模块仍会保留标准化的模块结果，不会把任意字典自动写入物体档案顶层。内置元数据、质量和分割模块均有专用输出模型与适配器，通过 `asset_id` 对应图片；质量与分割适配器只验证结果，不改写物体事实。分割文件另由流水线和存储层检查真实存在、归属及几何一致性。显式传入 `processors` 或 `pipeline` 时仍完全采用调用方配置，不自动追加默认模块。
 
 `Pipeline.run(existing_profile, data_dir)` 和 `ProfileAssembler.merge_result(existing_profile, result)` 可以在已有档案副本上继续补充数据，保留已有模块记录。当前 HTTP 创建接口和 `collect()` 每次创建新档案；面向同一档案的持久化更新、追加图片及并发修订接口尚未实现，后续可在现有数据契约上增量加入。
 
@@ -285,5 +303,9 @@ V0.1 在当前 HTTP 请求内顺序处理。后续接入耗时三维重建时，
 质量评估测试覆盖细节图、低分辨率、过暗、过亮、低对比度、低细节响应、多图、逐图故障、EXIF/透明度、像素及路径限制、数据模型一致性、默认流水线和 HTTP 查询/下载/落盘一致性。页面渲染测试检查中文建议、重复文件名的资源对应关系和不可信内容的安全文本显示。
 
 2026-10-29 本轮完整验证为 **178 passed，1 warning**，其中包含原有 104 项测试。唯一警告是既有 Starlette TestClient/httpx 弃用提示。页面 DOM 回归通过本机 Node 执行实际 `app.js` 的选图、提交和渲染事件链；没有 Node 时仅这组可选测试会跳过，服务本身不依赖 Node。浏览器页面已能打开，本轮文件选择接口故障导致未完成真实浏览器上传，不能将自动化结果视作手机实机验收。
+
+分割测试另覆盖空/全图/异常掩码、模型与权重不可用、提示与 EXIF 坐标、混合图片故障、PNG 文件保存与安全预览、产物残留清理及提交失败回滚。模型边界测试使用只存在于测试代码的后端注入；真实权重烟测默认跳过，必须手动配置后显式开启，不能用测试掩码冒充已运行真实模型。
+
+2026-10-30 分割模块整合后完整结果为 **295 passed、1 skipped、1 warning**。跳过的是未配置依赖和权重的真实模型烟测；已通过 Windows 长路径下的掩码保存、提交、读取和 HTTP 预览回归。详细测试命令与验证边界见[分割模块说明](docs/segmentation.md)。
 
 手工验收时还应完成一次电脑浏览器与手机浏览器的真实上传，并核对页面查看、下载和本地文件。此步骤取决于实际浏览器、设备和局域网环境。

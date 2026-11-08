@@ -234,6 +234,8 @@ Content-Type: application/json
 
 服务端只访问固定百度 HTTPS 地址，限制响应大小，拒绝重定向。异常对外使用安全的中文说明；不会将密钥、access token、完整请求地址或照片 Base64 写入档案、页面和错误日志。
 
+百度返回 Mask 的模式或尺寸故障排查、安全日志范围，以及需要开发者确认后才能执行的一次性真实验收方案，见[百度 Mask 诊断说明](baidu_mask_diagnostics.md)。历史合并错误不能单独证明返回的是哪一种 PNG 编码；未取得真实样本前，不通过猜测透明通道或强制转换来放宽接受范围。
+
 ## 提示与坐标约定
 
 HTTP 创建接口的可选 multipart 文本字段 `segmentation_boxes` 为 JSON 数组，长度必须与 `images` 一致；每项是 `null` 或 `[x0,y0,x1,y1]`。按实际图片上传顺序关联，不按文件名关联。

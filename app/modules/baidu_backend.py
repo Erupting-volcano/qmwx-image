@@ -10,9 +10,11 @@ import base64
 import binascii
 from io import BytesIO
 import json
+import logging
 import math
 from threading import Lock
 import time
+from uuid import UUID, uuid4
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -35,6 +37,7 @@ MAX_IMAGE_BASE64_BYTES = 9_500_000  # Below the documented 10 MB limit.
 MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 MAX_TOKEN_RESPONSE_BYTES = 64 * 1024
 MAX_MASK_BYTES = 16 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -195,18 +198,57 @@ class BaiduSegmentationBackend:
         raise SegmentationAPIError("图片编码后超过API安全大小限制，请减小图片或重新拍摄。")
 
     @staticmethod
-    def _decode_mask(encoded, expected_size: tuple[int, int], warnings: list[str]) -> Image.Image:
-        if not isinstance(encoded, str) or not encoded or len(encoded) > MAX_RESPONSE_BYTES:
-            raise SegmentationAPIError("百度分割API没有返回有效掩码。")
+    def _decode_mask(encoded, expected_size: tuple[int, int], warnings: list[str], *, diagnostic_id=None) -> Image.Image:
+        # Only fixed statuses and image header numbers are logged, never payloads.
+        diagnostic_id = str(UUID(str(diagnostic_id))) if diagnostic_id is not None else str(uuid4())
+        diagnostic = {
+            "diagnostic_id": diagnostic_id, "response_format": None, "response_mode": None,
+            "response_width": None, "response_height": None,
+            "expected_width": expected_size[0], "expected_height": expected_size[1],
+            "decoded_byte_length": None, "frame_count": None, "has_transparency": None,
+            "decode_status": "not_started", "normalization_status": "not_started",
+        }
+        mask = None
         try:
-            content = base64.b64decode(encoded, validate=True)
+            if not isinstance(encoded, str) or not encoded or len(encoded) > MAX_RESPONSE_BYTES:
+                diagnostic["decode_status"] = "invalid_image_field"
+                raise SegmentationAPIError("百度分割API没有返回有效的掩码编码，请根据错误编号排查。")
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                diagnostic["decode_status"] = "invalid_base64"
+                raise SegmentationAPIError("百度分割API返回的掩码编码无法解码，请根据错误编号排查。") from None
+            diagnostic["decoded_byte_length"] = len(content)
+            diagnostic["decode_status"] = "base64_decoded"
             if not content or len(content) > MAX_MASK_BYTES:
+                diagnostic["decode_status"] = "decoded_size_rejected"
                 raise SegmentationAPIError("API掩码文件超过安全大小限制。")
             with Image.open(BytesIO(content)) as returned:
-                if (returned.format != "PNG" or returned.mode not in {"L", "1"}
-                        or returned.size != expected_size or getattr(returned, "n_frames", 1) != 1):
-                    raise SegmentationAPIError("API掩码的格式、模式或尺寸与送入API的图片不一致。")
+                diagnostic.update({
+                    "response_format": returned.format if returned.format in {"PNG", "JPEG", "BMP", "WEBP", "GIF", "TIFF", "ICO", "PPM"} else "other",
+                    "response_mode": returned.mode if returned.mode in {"L", "1", "P", "RGB", "RGBA", "LA", "I", "I;16", "I;16B", "CMYK", "F"} else "other",
+                    "response_width": returned.width, "response_height": returned.height,
+                    "frame_count": getattr(returned, "n_frames", 1),
+                    "has_transparency": "transparency" in returned.info or "A" in returned.getbands(),
+                    "decode_status": "header_read",
+                })
+                if returned.format != "PNG":
+                    diagnostic["normalization_status"] = "rejected_format"
+                    raise SegmentationAPIError("百度返回的掩码不是PNG，已拒绝保存，请根据错误编号排查。")
+                if getattr(returned, "n_frames", 1) != 1:
+                    diagnostic["normalization_status"] = "rejected_animation"
+                    raise SegmentationAPIError("百度返回的是多帧掩码，已拒绝保存，请根据错误编号排查。")
+                if returned.size != expected_size:
+                    diagnostic["normalization_status"] = "rejected_dimensions"
+                    raise SegmentationAPIError("百度返回的掩码尺寸与API输入不一致，已拒绝保存，请根据错误编号排查。")
+                if returned.mode not in {"L", "1"}:
+                    diagnostic["normalization_status"] = "rejected_mode"
+                    raise SegmentationAPIError("百度返回的掩码编码模式暂不支持，已拒绝保存，请根据错误编号排查。")
+                if "transparency" in returned.info:
+                    diagnostic["normalization_status"] = "rejected_transparency"
+                    raise SegmentationAPIError("百度返回的掩码含透明信息，尚不能确认其前景含义，已拒绝保存。")
                 returned.load()
+                diagnostic["decode_status"] = "pixels_loaded"
                 mask = returned.convert("L")
             histogram = mask.histogram()
             if sum(histogram[1:255]):
@@ -214,9 +256,25 @@ class BaiduSegmentationBackend:
                     binary = mask.point(lambda value: 255 if value >= 128 else 0)
                 warnings.append("API返回了灰度边缘，已按128阈值二值化；请人工复查细边界。")
                 mask = binary
+                diagnostic["normalization_status"] = "thresholded_128"
+            else:
+                diagnostic["normalization_status"] = "binary_l"
+            # API coordinates are already oriented; do not carry PNG EXIF/ICC onward.
+            mask.info.clear()
             return mask
-        except (binascii.Error, ValueError, UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError):
-            raise SegmentationAPIError("百度分割API返回的掩码无法安全解码。") from None
+        except SegmentationAPIError as error:
+            error.add_note(f"百度掩码服务端诊断编号：{diagnostic_id}")
+            raise
+        except (ValueError, UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError):
+            if mask is not None:
+                mask.close()
+            diagnostic["decode_status"] = "image_decode_failed"
+            error = SegmentationAPIError("百度分割API返回的掩码无法完整解码，请根据错误编号排查。")
+            error.add_note(f"百度掩码服务端诊断编号：{diagnostic_id}")
+            raise error from None
+        finally:
+            level = logging.INFO if diagnostic["normalization_status"] in {"binary_l", "thresholded_128"} else logging.WARNING
+            logger.log(level, "baidu_mask_decode %s", json.dumps(diagnostic, separators=(",", ":")))
 
     def predict(
         self, request: SegmentationRequest | Image.Image,
@@ -268,9 +326,17 @@ class BaiduSegmentationBackend:
                 raise SegmentationUnavailable("百度访问令牌无效或已过期，请重试以重新获取令牌；本次没有自动重试分割请求。")
             code = str(error_code) if isinstance(error_code, int) and not isinstance(error_code, bool) else "未知"
             raise SegmentationAPIError(f"百度分割API返回错误（错误码{code}），请检查服务权限、额度和图片参数。")
-        with self._decode_mask(payload.get("image"), api_size, warnings) as api_mask:
+        diagnostic_id = str(uuid4())
+        geometry = {"diagnostic_id": diagnostic_id, "original_width": image.width, "original_height": image.height,
+                    "api_width": api_size[0], "api_height": api_size[1],
+                    "unpadded_width": region[2] - region[0], "unpadded_height": region[3] - region[1],
+                    "mapping_status": "awaiting_decode"}
+        logger.info("baidu_mask_geometry %s", json.dumps(geometry, separators=(",", ":")))
+        with self._decode_mask(payload.get("image"), api_size, warnings, diagnostic_id=diagnostic_id) as api_mask:
             with api_mask.crop(region) as unpadded:
                 mask = unpadded.resize(image.size, Image.Resampling.NEAREST) if unpadded.size != image.size else unpadded.copy()
+        geometry.update({"final_width": mask.width, "final_height": mask.height, "mapping_status": "mapped"})
+        logger.info("baidu_mask_geometry %s", json.dumps(geometry, separators=(",", ":")))
         return MaskPrediction(
             mask=mask, score=None, warnings=tuple(warnings),
             model_id=self.model_id, model_version=self.model_version,

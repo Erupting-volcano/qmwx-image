@@ -248,7 +248,7 @@ def test_missing_or_corrupt_mask_is_safely_rejected(rgb, response):
 def test_mask_mode_and_dimensions_are_checked_before_decode(rgb, mode, size):
     with Image.new(mode, size) as mask:
         instance, _ = backend(token(), {"image": png64(mask)})
-    with pytest.raises(SegmentationAPIError, match="格式、模式或尺寸"):
+    with pytest.raises(SegmentationAPIError, match="尺寸.*不一致|编码模式暂不支持"):
         instance.predict(rgb, BOX)
 
 
@@ -256,7 +256,7 @@ def test_animated_png_is_not_accepted_as_static_mask(rgb):
     with Image.new("L", rgb.size, 0) as first, Image.new("L", rgb.size, 255) as second, BytesIO() as stream:
         first.save(stream, format="PNG", save_all=True, append_images=[second], duration=100)
         instance, _ = backend(token(), {"image": base64.b64encode(stream.getvalue()).decode()})
-    with pytest.raises(SegmentationAPIError, match="格式、模式或尺寸"):
+    with pytest.raises(SegmentationAPIError, match="多帧掩码"):
         instance.predict(rgb, BOX)
 
 

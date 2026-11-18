@@ -69,6 +69,18 @@ def _atomic_replace(source: Path, destination: Path) -> None:
         os.replace(storage_io_path(source, force=True), storage_io_path(destination, force=True))
 
 
+def _replace_profile_file(object_dir: Path, payload: dict) -> dict:
+    """Write a validated profile payload as profile.json inside an object directory."""
+    content = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    temporary_path = Path(object_dir) / f"profile.{uuid4()}.tmp"
+    with storage_io_path(temporary_path).open("x", encoding="utf-8", newline="\n") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _atomic_replace(temporary_path, Path(object_dir) / "profile.json")
+    return json.loads(content)
+
+
 def _path_without_links(root: Path, relative_path: str) -> Path:
     """Resolve only descendants with no symlink or junction components."""
     root = _storage_resolved_path(Path(root))
@@ -288,14 +300,7 @@ class ObjectTransaction(AbstractContextManager):
         payload = profile.model_dump(mode="json")
         ObjectProfile.model_validate(payload)
         self._retain_referenced_masks(profile)
-        content = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
-        temporary_path = self.object_dir / f"profile.{uuid4()}.tmp"
-        with storage_io_path(temporary_path).open("x", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _atomic_replace(temporary_path, self.object_dir / "profile.json")
-        return json.loads(content)
+        return _replace_profile_file(self.object_dir, payload)
 
     def commit(self) -> None:
         destination = self.storage.object_dir(self.object_id)
@@ -328,6 +333,10 @@ class LocalStorage:
     def transaction(self, object_id: UUID) -> ObjectTransaction:
         return ObjectTransaction(self, object_id)
 
+    def update_transaction(self, object_id: UUID) -> "ObjectUpdateTransaction":
+        """Rewrite an existing object atomically; see ObjectUpdateTransaction."""
+        return ObjectUpdateTransaction(self, object_id)
+
     def read_profile(self, object_id: UUID) -> tuple[ObjectProfile, bytes]:
         profile_path = self.object_dir(object_id) / "profile.json"
         try:
@@ -341,3 +350,200 @@ class LocalStorage:
         except (ValueError, TypeError) as exc:
             raise CorruptProfileError from exc
         return profile, content
+
+
+ARTIFACT_DIRECTORY = "geometry"
+
+# Extension whitelist per artifact kind. The first entry is the canonical one.
+ARTIFACT_KINDS: dict[str, tuple[str, ...]] = {
+    "point_cloud": (".ply", ".pcd"),
+    "mesh": (".ply", ".obj", ".glb"),
+    "cameras": (".bin", ".json", ".txt"),
+}
+
+
+def _positive_limit(max_bytes: object) -> int:
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError("产物大小上限必须为正整数")
+    return max_bytes
+
+
+def _clone_object_tree(source: Path, destination: Path) -> None:
+    """Mirror an object directory, hard-linking unchanged files instead of copying."""
+    pending = [(Path(source), Path(destination))]
+    while pending:
+        current, target = pending.pop()
+        storage_io_path(target).mkdir(parents=True, exist_ok=True)
+        for entry in storage_io_path(current).iterdir():
+            logical = _logical_path(entry)
+            if logical.is_symlink():
+                raise ValueError("物体目录中不允许符号链接")
+            child = target / logical.name
+            if logical.is_dir():
+                pending.append((logical, child))
+                continue
+            if not logical.is_file():
+                raise ValueError("物体目录中只允许普通文件和目录")
+            try:
+                os.link(storage_io_path(logical, force=True), storage_io_path(child, force=True))
+            except OSError:
+                # Volumes without hard links still get a correct, slower copy.
+                shutil.copy2(storage_io_path(logical, force=True), storage_io_path(child, force=True))
+
+
+class ObjectUpdateTransaction(AbstractContextManager):
+    """Add results to an existing object with all-or-nothing publication.
+
+    ``ObjectTransaction`` creates an object once; this class rewrites one that
+    already exists. The live directory keeps serving reads until ``commit()``,
+    which moves it aside, publishes the staged copy, and restores the previous
+    directory byte for byte if publication fails.
+
+    Concurrent updates of one object are not coordinated: the last commit wins.
+    Callers that can overlap must serialise them (the reconstruction service
+    uses a single worker for this reason).
+    """
+
+    def __init__(self, storage: "LocalStorage", object_id: UUID):
+        self.storage = storage
+        self.object_id = UUID(str(object_id))
+        token = uuid4()
+        self.data_dir = storage.data_dir / ".staging" / str(token)
+        self.object_dir = self.data_dir / "objects" / str(self.object_id)
+        self.live_dir = storage.object_dir(self.object_id)
+        self.backup_dir = storage.data_dir / ".staging" / f"{token}.backup"
+        self._entered = False
+        self._committed = False
+
+    def __enter__(self) -> "ObjectUpdateTransaction":
+        if not storage_io_path(self.live_dir / "profile.json").is_file():
+            raise ProfileNotFoundError("物体档案不存在")
+        storage_io_path(self.object_dir).mkdir(parents=True, exist_ok=False)
+        try:
+            _clone_object_tree(self.live_dir, self.object_dir)
+        except BaseException:
+            shutil.rmtree(storage_io_path(self.data_dir, force=True), ignore_errors=True)
+            raise
+        self._entered = True
+        return self
+
+    def _ensure_active(self) -> None:
+        """Reject use before entry or after publication, when staging is gone."""
+        if not self._entered:
+            raise RuntimeError("更新事务尚未开始")
+        if self._committed:
+            raise RuntimeError("更新事务已经提交，不能再写入")
+
+    def read_profile(self) -> ObjectProfile:
+        """Return the staged copy of the current profile."""
+        self._ensure_active()
+        content = storage_io_path(self.object_dir / "profile.json").read_bytes()
+        profile = ObjectProfile.model_validate_json(content)
+        if profile.object_id != self.object_id:
+            raise ValueError("Stored object ID mismatch")
+        return profile
+
+    def save_profile(self, profile: ObjectProfile) -> dict:
+        self._ensure_active()
+        if profile.object_id != self.object_id:
+            raise ValueError("Transaction object ID mismatch")
+        # Validate the final serialized form, including all nested module output.
+        payload = profile.model_dump(mode="json")
+        ObjectProfile.model_validate(payload)
+        return _replace_profile_file(self.object_dir, payload)
+
+    def save_artifact(self, kind: str, source: Path, *, max_bytes: int) -> str:
+        """Copy one geometry artifact into this object and return its archive-owned path."""
+        self._ensure_active()
+        if kind not in ARTIFACT_KINDS:
+            raise ValueError("未知的产物类型")
+        limit = _positive_limit(max_bytes)
+        origin = _logical_path(Path(source))
+        try:
+            if not storage_io_path(origin).is_file():
+                raise FileNotFoundError("产物源文件不存在")
+            size = storage_io_path(origin).stat().st_size
+        except OSError as exc:
+            raise FileNotFoundError("产物源文件不可读") from exc
+        if size <= 0:
+            raise ValueError("产物文件为空")
+        if size > limit:
+            raise ValueError("产物文件超过大小上限")
+        suffix = origin.suffix.lower()
+        if suffix not in ARTIFACT_KINDS[kind]:
+            raise ValueError("产物文件类型不受支持")
+        relative_directory = f"objects/{self.object_id}/{ARTIFACT_DIRECTORY}"
+        directory = _path_without_links(self.data_dir, relative_directory)
+        storage_io_path(directory).mkdir(parents=True, exist_ok=True)
+        destination = directory / f"{kind}-{uuid4()}{suffix}"
+        temporary = directory / f".{uuid4()}.tmp"
+        try:
+            with storage_io_path(origin, force=True).open("rb") as reader, \
+                    storage_io_path(temporary, force=True).open("xb") as writer:
+                shutil.copyfileobj(reader, writer, 1024 * 1024)
+                writer.flush()
+                os.fsync(writer.fileno())
+            if storage_io_path(destination).exists():
+                raise FileExistsError("产物文件已存在")
+            _atomic_replace(temporary, destination)
+        finally:
+            storage_io_path(temporary).unlink(missing_ok=True)
+        return f"{relative_directory}/{destination.name}"
+
+    def commit(self) -> None:
+        """Swap the staged object into place, restoring the old one on failure."""
+        if not self._entered:
+            raise RuntimeError("更新事务尚未开始")
+        if self._committed:
+            raise RuntimeError("更新事务已经提交")
+        storage_io_path(self.backup_dir.parent).mkdir(parents=True, exist_ok=True)
+        _atomic_replace(self.live_dir, self.backup_dir)
+        try:
+            _atomic_replace(self.object_dir, self.live_dir)
+        except BaseException:
+            _atomic_replace(self.backup_dir, self.live_dir)
+            raise
+        self._committed = True
+        shutil.rmtree(storage_io_path(self.backup_dir, force=True), ignore_errors=True)
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        # Only ever delete inside the staging area, never the published object.
+        allowed = _storage_resolved_path(self.storage.data_dir / ".staging")
+        for path in (self.data_dir, self.backup_dir):
+            target = _storage_resolved_path(path)
+            if target == allowed or not target.is_relative_to(allowed):
+                continue
+            if storage_io_path(target).exists():
+                shutil.rmtree(storage_io_path(target, force=True), ignore_errors=True)
+
+
+def resolve_artifact_path(
+    data_dir: Path, object_id: UUID, relative_path: str, *, max_bytes: int,
+    expected_kind: str | None = None,
+) -> Path:
+    """Validate an archive-owned geometry artifact before reading or merging it."""
+    safe_path = safe_relative_path(relative_path)
+    parts = safe_path.split("/")
+    object_id = UUID(str(object_id))
+    if len(parts) != 4 or parts[:3] != ["objects", str(object_id), ARTIFACT_DIRECTORY]:
+        raise ValueError("产物不属于当前物体档案")
+    filename = Path(parts[-1])
+    kind, _, identifier = filename.stem.partition("-")
+    if kind not in ARTIFACT_KINDS:
+        raise ValueError("产物文件名中的类型无效")
+    if expected_kind is not None and kind != expected_kind:
+        raise ValueError("产物类型与预期不一致")
+    try:
+        if str(UUID(identifier)) != identifier:
+            raise ValueError
+    except ValueError:
+        raise ValueError("产物文件名无效") from None
+    if filename.suffix.lower() not in ARTIFACT_KINDS[kind]:
+        raise ValueError("产物文件类型不受支持")
+    limit = _positive_limit(max_bytes)
+    path = storage_io_path(_path_without_links(Path(data_dir), safe_path))
+    if not path.is_file():
+        raise FileNotFoundError("产物文件不存在")
+    if path.stat().st_size > limit:
+        raise ValueError("产物文件超过大小上限")
+    return path

@@ -1,6 +1,7 @@
 """Run with: python -m uvicorn app.main:app --host 127.0.0.1 --port 8000."""
 
 from collections.abc import Sequence
+from contextlib import asynccontextmanager
 import logging
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.formparsers import MultiPartException
 
 from app.api.routes import BODY_LIMIT_MARKER, router
+from app.api.reconstruction_routes import router as reconstruction_router
 from app.config import PROJECT_ROOT, Settings
 from app.modules.base import BaseProcessor
 from app.services.pipeline import Pipeline
@@ -60,18 +62,44 @@ class UploadBodyLimitMiddleware:
 
 def create_app(settings: Settings | None = None,
                processors: Sequence[BaseProcessor] | None = None,
-               *, pipeline: Pipeline | None = None) -> FastAPI:
+               *, pipeline: Pipeline | None = None,
+               reconstruction_service=None) -> FastAPI:
     settings = settings or Settings()
     collection_service = ImageCollectionService(settings, processors, pipeline=pipeline)
+    if reconstruction_service is None and settings.reconstruction_enabled:
+        # Imported lazily so a project without COLMAP never pays for the backend.
+        from app.modules.reconstruction.colmap_backend import ColmapBackend
+        from app.services.reconstruction_service import ReconstructionService
+
+        command = (settings.colmap_binary,) if settings.colmap_binary else ("colmap",)
+        reconstruction_service = ReconstructionService(
+            settings,
+            backends=(ColmapBackend(command, timeout_seconds=settings.reconstruction_timeout_seconds,
+                                     max_images=settings.reconstruction_max_images),),
+            job_timeout_seconds=settings.reconstruction_timeout_seconds,
+            max_artifact_bytes=settings.reconstruction_max_artifact_bytes,
+        )
+        reconstruction_service.recover()
+    holder = {"service": reconstruction_service}
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        yield
+        if holder["service"] is not None:
+            holder["service"].shutdown()
+
     application = FastAPI(title="其命维新 · 物体信息输入与数字化模块", version="0.1.0",
-                          description="旧物改造主项目的基础模块：图片输入、元数据、质量筛查及可切换后端的可选框选前景分割。")
+                          description="旧物改造主项目的基础模块：图片输入、元数据、质量筛查及可切换后端的可选框选前景分割。",
+                          lifespan=lifespan)
     application.state.settings = settings
     application.state.storage = collection_service.storage
     application.state.collection_service = collection_service
+    application.state.reconstruction_service = reconstruction_service
     application.add_middleware(UploadBodyLimitMiddleware,
                                limit=settings.max_total_bytes + 1024 * 1024)
     application.mount("/static", StaticFiles(directory=PROJECT_ROOT / "app" / "web"), name="static")
     application.include_router(router)
+    application.include_router(reconstruction_router)
 
     @application.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):

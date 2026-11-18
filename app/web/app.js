@@ -13,12 +13,17 @@
     "warnings-list", "profile-json", "view-json", "download-json", "drop-description", "upload-hint",
     "quality-summary", "quality-images", "segmentation-config-note", "segmentation-summary", "segmentation-images",
     "recognition-config-note", "understanding-summary", "understanding-results",
+    "reconstruction-summary", "start-reconstruction", "download-point-cloud", "reconstruction-status",
   ].map((id) => [id, document.getElementById(id)]));
 
   let selectedFiles = [];
   let isBusy = false;
   let isReadingFiles = false;
   let fileSequence = 0;
+  let currentObjectId = null;
+  let reconstructionEnabled = false;
+  let reconstructionPoll = null;
+  let reconstructionRunning = false;
 
   function createNode(tagName, className, content) {
     const node = document.createElement(tagName);
@@ -76,6 +81,11 @@
           ? `物体理解已启用（${model}）：照片及已校验的观察信息会发送至服务端配置的模型服务商，可能产生费用。${limit}AI 材料和类别保留为候选，请核对来源与依据。`
           : "物体理解当前未启用，图片采集、质量评估及独立配置的分割仍可使用。启用后照片和观察信息将发送至模型服务商，可能产生费用。";
       }
+      reconstructionEnabled = config.reconstruction_enabled === true;
+      elements["reconstruction-summary"].textContent = reconstructionEnabled
+        ? "点击下方按钮，把这批照片交给后台做多视角重建。完成后可下载点云。"
+        : "三维重建当前未启用：请管理员开启 DIGITIZER_RECONSTRUCTION_ENABLED 并配置 COLMAP 路径后重启服务。";
+      elements["start-reconstruction"].disabled = !reconstructionEnabled;
       renderFiles();
     } catch {
       // The form remains usable with the default limits; the server validates every upload.
@@ -594,6 +604,96 @@
     if (!images.length) list.append(createNode("li", "quality-note", "暂无图片可供理解。"));
   }
 
+  const RECONSTRUCTION_STAGES = {
+    preflight: "准备", feature_extraction: "特征提取", matching: "特征匹配",
+    mapping: "三维重建", dense: "稠密重建", export: "导出",
+  };
+
+  function setReconstructionStatus(text) {
+    elements["reconstruction-status"].textContent = text;
+  }
+
+  function resetReconstruction(profile) {
+    if (reconstructionPoll) {
+      clearInterval(reconstructionPoll);
+      reconstructionPoll = null;
+    }
+    reconstructionRunning = false;
+    elements["start-reconstruction"].disabled = !reconstructionEnabled;
+    const link = elements["download-point-cloud"];
+    const existing = profile?.geometry?.point_cloud_path;
+    if (typeof existing === "string" && existing) {
+      link.href = `/api/v1/objects/${encodeURIComponent(currentObjectId)}/geometry/point_cloud`;
+      link.hidden = false;
+      setReconstructionStatus("档案中已有点云，可以下载，也可以重新重建。");
+    } else {
+      link.hidden = true;
+      setReconstructionStatus("");
+    }
+  }
+
+  function pollReconstruction(jobId) {
+    clearInterval(reconstructionPoll);
+    reconstructionPoll = setInterval(async () => {
+      try {
+        const response = await fetch(`/api/v1/reconstructions/${encodeURIComponent(jobId)}`, {
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) return;
+        const job = await response.json();
+        if (job.status === "queued" || job.status === "running") {
+          const stage = RECONSTRUCTION_STAGES[job.stage] || "处理中";
+          const percent = Math.round((Number(job.progress) || 0) * 100);
+          setReconstructionStatus(`${stage} · ${percent}%`);
+          return;
+        }
+        clearInterval(reconstructionPoll);
+        reconstructionPoll = null;
+        reconstructionRunning = false;
+        elements["start-reconstruction"].disabled = !reconstructionEnabled;
+        if (job.status === "succeeded") {
+          setReconstructionStatus("重建完成，点云已写入档案。");
+          const link = elements["download-point-cloud"];
+          link.href = `/api/v1/objects/${encodeURIComponent(currentObjectId)}/geometry/point_cloud`;
+          link.hidden = false;
+        } else if (job.status === "canceled") {
+          setReconstructionStatus("任务已取消。");
+        } else {
+          setReconstructionStatus(`重建未完成：${job.error_message || job.status}`);
+        }
+      } catch {
+        // 网络抖动时继续轮询，不打断任务。
+      }
+    }, 1500);
+  }
+
+  async function startReconstruction() {
+    if (!currentObjectId || reconstructionRunning || !reconstructionEnabled) return;
+    reconstructionRunning = true;
+    const button = elements["start-reconstruction"];
+    button.disabled = true;
+    setReconstructionStatus("正在提交重建任务…");
+    try {
+      const response = await fetch(`/api/v1/objects/${encodeURIComponent(currentObjectId)}/reconstructions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: "{}",
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || !payload?.job_id) {
+        setReconstructionStatus(payload?.detail?.message || "提交失败，请稍后重试。");
+        reconstructionRunning = false;
+        button.disabled = false;
+        return;
+      }
+      pollReconstruction(payload.job_id);
+    } catch {
+      setReconstructionStatus("网络异常，提交未完成。");
+      reconstructionRunning = false;
+      button.disabled = false;
+    }
+  }
+
   function renderResult(payload) {
     const profile = payload.profile;
     const objectId = payload.object_id;
@@ -665,10 +765,13 @@
       ? `档案已保存，共 ${images.length} 张图片。请查看处理提示和待补充的信息。`
       : `档案已保存，共 ${images.length} 张图片。`;
     elements["result-section"].scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+    currentObjectId = objectId;
+    resetReconstruction(profile);
     elements["profile-name"].focus({ preventScroll: true });
   }
 
   elements["image-input"].addEventListener("change", (event) => addFiles(event.target.files));
+  elements["start-reconstruction"].addEventListener("click", startReconstruction);
   elements["clear-files"].addEventListener("click", () => {
     if (isBusy || isReadingFiles) return;
     selectedFiles.forEach((entry) => { if (entry.objectUrl) URL.revokeObjectURL(entry.objectUrl); });

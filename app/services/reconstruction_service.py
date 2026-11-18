@@ -63,6 +63,11 @@ class ReconstructionService:
 
     # -- public API -------------------------------------------------------
 
+    @property
+    def default_backend_id(self) -> str | None:
+        """First registered backend, used when a request names none."""
+        return next(iter(self.backends), None)
+
     def submit(self, request: ReconstructionRequest) -> ReconstructionJob:
         """Record the job and start it; returns immediately with a queued record."""
         backend = self.backends.get(request.backend_id)

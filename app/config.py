@@ -87,6 +87,14 @@ class Settings:
     recognition_max_output_tokens: int = field(default_factory=lambda: _env_int("DIGITIZER_RECOGNITION_MAX_OUTPUT_TOKENS", 8192))
     recognition_task_models: dict = field(default_factory=lambda: _env_json_object("DIGITIZER_RECOGNITION_TASK_MODELS"))
     recognition_model_configs: dict = field(default_factory=lambda: _env_json_object("DIGITIZER_RECOGNITION_MODEL_CONFIGS"), repr=False)
+    reconstruction_enabled: bool = field(default_factory=lambda: _env_bool("DIGITIZER_RECONSTRUCTION_ENABLED"))
+    colmap_binary: str = field(default_factory=lambda: os.environ.get("DIGITIZER_COLMAP_BINARY", "").strip())
+    reconstruction_timeout_seconds: float = field(default_factory=lambda: float(os.environ.get(
+        "DIGITIZER_RECONSTRUCTION_TIMEOUT_SECONDS", "3600")))
+    reconstruction_max_images: int = field(default_factory=lambda: _env_int(
+        "DIGITIZER_RECONSTRUCTION_MAX_IMAGES", 120))
+    reconstruction_max_artifact_bytes: int = field(default_factory=lambda: _env_int(
+        "DIGITIZER_RECONSTRUCTION_MAX_ARTIFACT_BYTES", 536_870_912))
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data_dir", Path(self.data_dir).expanduser().resolve())
@@ -147,3 +155,17 @@ class Settings:
         # Detach caller mappings; frozen settings must not share mutable route input.
         object.__setattr__(self, "recognition_task_models", dict(self.recognition_task_models))
         object.__setattr__(self, "recognition_model_configs", json.loads(json.dumps(self.recognition_model_configs)))
+        if type(self.reconstruction_enabled) is not bool:
+            raise ValueError("reconstruction_enabled must be a boolean")
+        if not isinstance(self.colmap_binary, str) or any(
+                ord(character) < 32 for character in self.colmap_binary):
+            raise ValueError("COLMAP path must be text without control characters")
+        timeout = self.reconstruction_timeout_seconds
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or not 1 <= timeout <= 86_400):
+            raise ValueError("reconstruction_timeout_seconds must be between 1 and 86400")
+        for name, upper in (("reconstruction_max_images", 500),
+                            ("reconstruction_max_artifact_bytes", 2 * 1024 ** 3)):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= upper:
+                raise ValueError(f"{name} is outside its supported positive range")

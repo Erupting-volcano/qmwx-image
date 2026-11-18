@@ -100,6 +100,16 @@
               <ul id="understanding-results" class="quality-images"></ul>
             </section>
             <section id="warnings-section" class="warnings-section" hidden><h4>处理提示</h4><ul id="warnings-list"></ul></section>
+            <section class="quality-section" aria-labelledby="reconstruction-title">
+              <h4 id="reconstruction-title">三维重建</h4>
+              <p id="reconstruction-summary" class="quality-summary"></p>
+              <p class="quality-note">重建在后台运行，关闭页面不会中断任务。当前只做稀疏重建：产出点云与相机参数，没有真实毫米尺度，也不能直接用于加工。照片数量与重叠会影响成功率。</p>
+              <div class="result-links">
+                <button id="start-reconstruction" class="secondary-button" type="button">开始三维重建</button>
+                <a id="download-point-cloud" class="download-button" hidden download>下载点云 (.ply) <span aria-hidden="true">↓</span></a>
+              </div>
+              <p id="reconstruction-status" class="upload-status" role="status" aria-live="polite"></p>
+            </section>
             <details class="json-details"><summary>查看完整档案 JSON <span>结构化原始记录</span></summary><pre id="profile-json" tabindex="0" aria-label="完整档案 JSON"></pre></details>
             <div class="result-footer"><p>档案已保存，可继续用于后续处理。</p><div class="result-links"><a id="view-json" class="secondary-button" target="_blank" rel="noopener">在线查看 JSON <span aria-hidden="true">↗</span></a><a id="download-json" class="download-button" download>下载 JSON <span aria-hidden="true">↓</span></a></div></div>
           </div>

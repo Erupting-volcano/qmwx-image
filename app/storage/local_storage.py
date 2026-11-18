@@ -15,6 +15,7 @@ from PIL import Image
 
 from app.models._common import safe_relative_path
 from app.models.object_profile import ObjectProfile
+from app.models.reconstruction import ARTIFACT_DIRECTORY, ARTIFACT_EXTENSIONS
 
 
 logger = logging.getLogger(__name__)
@@ -352,14 +353,8 @@ class LocalStorage:
         return profile, content
 
 
-ARTIFACT_DIRECTORY = "geometry"
-
-# Extension whitelist per artifact kind. The first entry is the canonical one.
-ARTIFACT_KINDS: dict[str, tuple[str, ...]] = {
-    "point_cloud": (".ply", ".pcd"),
-    "mesh": (".ply", ".obj", ".glb"),
-    "cameras": (".bin", ".json", ".txt"),
-}
+# The artifact whitelist lives with the data contract, so storage and results agree.
+ARTIFACT_KINDS = ARTIFACT_EXTENSIONS
 
 
 def _positive_limit(max_bytes: object) -> int:

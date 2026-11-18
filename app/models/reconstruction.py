@@ -206,7 +206,8 @@ class ReconstructionJob(ContractModel):
         timeline = [moment for moment in (self.created_at, self.started_at, self.finished_at) if moment is not None]
         if timeline != sorted(timeline):
             raise ValueError("任务时间顺序无效")
-        if self.error_code is None and self.error_message is not None:
+        # Cancellation is not a failure: a reason without an error code is enough.
+        if self.status != "canceled" and self.error_code is None and self.error_message is not None:
             raise ValueError("错误说明必须与错误码同时出现")
         return self
 

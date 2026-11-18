@@ -72,10 +72,13 @@ def test_atomic_replace_failure_rolls_back_completed_staging(settings, png_bytes
         object_publish = destination.parent == settings.data_dir / "objects"
         if (phase == "profile" and profile_write) or (phase == "commit" and object_publish):
             # The failure happens after bytes have actually reached staging.
-            assert source.exists()
+            # Inspect through the long-path aware helper: a logical path longer
+            # than MAX_PATH cannot be examined with plain Path methods on Windows.
+            staging = local_storage.storage_io_path(source)
+            assert staging.exists()
             if object_publish:
-                assert (source / "profile.json").is_file()
-                assert list((source / "images").iterdir())
+                assert (staging / "profile.json").is_file()
+                assert list((staging / "images").iterdir())
             saw_failure.append(True)
             raise OSError(f"simulated {phase} replace failure")
         return original_replace(source, destination)

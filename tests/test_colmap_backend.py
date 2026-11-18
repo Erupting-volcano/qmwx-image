@@ -84,6 +84,22 @@ def test_masks_are_handed_to_the_feature_extractor(tmp_path):
     assert "--ImageReader.mask_path" in log
 
 
+def test_modern_colmap_gpu_flags_are_detected(tmp_path):
+    workspace = workspace_for(tmp_path)
+    run(backend(), workspace)
+    log = (workspace.root / "logs" / "feature_extraction.log").read_text(encoding="utf-8")
+    assert "--FeatureExtraction.use_gpu" in log
+    assert "--SiftExtraction.use_gpu" not in log
+
+
+def test_legacy_colmap_gpu_flags_still_work(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_COLMAP_LEGACY_FLAGS", "1")
+    workspace = workspace_for(tmp_path)
+    run(backend(), workspace)
+    log = (workspace.root / "logs" / "feature_extraction.log").read_text(encoding="utf-8")
+    assert "--SiftExtraction.use_gpu" in log
+
+
 def test_failed_stage_reports_the_log_tail(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_COLMAP_FAIL", "mapper")
     with pytest.raises(ReconstructionBackendError, match="mapping"):

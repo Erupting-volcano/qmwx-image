@@ -14,6 +14,7 @@ from app.models.reconstruction import CameraIntrinsics, ReconstructionRequest, S
 from app.modules.reconstruction.base import (
     BackendOutput, ReconstructionBackendError, ReconstructionCancelled, ReconstructionWorkspace,
 )
+from app.storage.local_storage import storage_io_path
 
 
 MIN_IMAGES = 5
@@ -26,10 +27,11 @@ CAMERA_MODELS = {
     "RADIAL": ("RADIAL", "f", "cx", "cy", "k1", "k2"),
     "OPENCV": ("OPENCV", "fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2"),
 }
+# COLMAP 4 prefixes these lines with its logger ("I... model.cc:439] Images: 6").
 ANALYZER_PATTERNS = {
-    "images": re.compile(r"^Images:\s*(\d+)\s*$", re.MULTILINE),
-    "points": re.compile(r"^Points:\s*(\d+)\s*$", re.MULTILINE),
-    "error": re.compile(r"^Mean reprojection error:\s*([0-9.]+)\s*px\s*$", re.MULTILINE),
+    "images": re.compile(r"\bImages:\s*(\d+)"),
+    "points": re.compile(r"\bPoints:\s*(\d+)"),
+    "error": re.compile(r"Mean reprojection error:\s*([0-9.]+)\s*px"),
 }
 
 
@@ -50,6 +52,7 @@ class ColmapBackend:
         self.command = tuple(str(part) for part in command)
         self.timeout_seconds = timeout_seconds
         self.max_images = max_images
+        self._gpu_flags: tuple[str, str] | None = None
 
     # -- contract ---------------------------------------------------------
 
@@ -72,17 +75,19 @@ class ColmapBackend:
         logs = workspace.root / "logs"
 
         report("feature_extraction", 0.10)
+        extraction_gpu_flag, matching_gpu_flag = self._gpu_options()
         self._run_tool("feature_extraction", [
             "feature_extractor", "--database_path", str(database), "--image_path", str(workspace.images_dir),
-            "--SiftExtraction.use_gpu", "0",
+            extraction_gpu_flag, "0",
         ] + (["--ImageReader.mask_path", str(workspace.masks_dir)] if workspace.mask_files else []), cancel, logs)
 
         report("matching", 0.30)
         self._run_tool("matching", [
-            "exhaustive_matcher", "--database_path", str(database), "--SiftMatching.use_gpu", "0",
+            "exhaustive_matcher", "--database_path", str(database), matching_gpu_flag, "0",
         ], cancel, logs)
 
         report("mapping", 0.55)
+        storage_io_path(sparse_dir).mkdir(parents=True, exist_ok=True)  # COLMAP 4 requires the directory
         self._run_tool("mapping", [
             "mapper", "--database_path", str(database), "--image_path", str(workspace.images_dir),
             "--output_path", str(sparse_dir),
@@ -94,6 +99,7 @@ class ColmapBackend:
 
         report("export", 0.85)
         text_dir = workspace.root / "export"
+        storage_io_path(text_dir).mkdir(parents=True, exist_ok=True)  # model_converter crashes on a missing directory
         self._run_tool("export", [
             "model_converter", "--input_path", str(model), "--output_path", str(text_dir),
             "--output_type", "TXT",
@@ -136,6 +142,26 @@ class ColmapBackend:
         )
 
     # -- process handling -------------------------------------------------
+
+    def _gpu_options(self) -> tuple[str, str]:
+        """COLMAP 4 renamed the SIFT flags; detect once per backend instance."""
+        if self._gpu_flags is None:
+            extraction_help = self._help_text("feature_extractor")
+            matching_help = self._help_text("exhaustive_matcher")
+            extraction = ("--FeatureExtraction.use_gpu" if "--FeatureExtraction.use_gpu" in extraction_help
+                          else "--SiftExtraction.use_gpu")
+            matching = ("--FeatureMatching.use_gpu" if "--FeatureMatching.use_gpu" in matching_help
+                        else "--SiftMatching.use_gpu")
+            self._gpu_flags = (extraction, matching)
+        return self._gpu_flags
+
+    def _help_text(self, command: str) -> str:
+        try:
+            completed = subprocess.run([*self.command, command, "-h"], capture_output=True, text=True,
+                                       timeout=60, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return (completed.stdout or "") + (completed.stderr or "")
 
     def _run_tool(self, label: str, args: Sequence[str], cancel: Callable[[], bool], logs: Path) -> None:
         if cancel():
@@ -236,6 +262,9 @@ class ColmapBackend:
         entries = [line for line in lines if not line.startswith("#")]
         if not entries:
             return None, ["cameras.txt 为空，无法读取相机内参"]
+        warnings = []
+        if len(entries) > 1:
+            warnings.append(f"模型包含 {len(entries)} 个相机，档案只记录第一个；多机位重建需人工核对")
         fields = entries[0].split()
         if len(fields) < 5:
             return None, ["cameras.txt 格式无法识别"]
@@ -255,7 +284,7 @@ class ColmapBackend:
             fx, fy = values["fx"], values["fy"]
         distortion = [value for key, value in values.items() if key not in {"f", "fx", "fy", "cx", "cy"}]
         return CameraIntrinsics(model=definition[0], width=width, height=height, fx=fx, fy=fy,
-                                cx=values["cx"], cy=values["cy"], distortion=distortion), []
+                                cx=values["cx"], cy=values["cy"], distortion=distortion), warnings
 
     def _binary_available(self) -> bool:
         executable = self.command[0]

@@ -17,6 +17,13 @@ def argument(name: str) -> str:
 def main() -> int:
     if len(sys.argv) < 2:
         return 2
+    if "-h" in sys.argv or "--help" in sys.argv:
+        # Mimic either COLMAP 4 (`FeatureExtraction`) or 3 (`SiftExtraction`) flags.
+        prefix = "Sift" if os.environ.get("FAKE_COLMAP_LEGACY_FLAGS") else "Feature"
+        print(f"--{prefix}Extraction.use_gpu arg (=1)")
+        print(f"--{prefix}Matching.use_gpu arg (=1)")
+        print("--ImageReader.mask_path arg")
+        return 0
     command = sys.argv[1]
     if os.environ.get("FAKE_COLMAP_FAIL") == command:
         print(f"simulated failure in {command}", file=sys.stderr)

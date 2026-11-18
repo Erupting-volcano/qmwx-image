@@ -78,7 +78,7 @@ def _bounded_options(value: dict[str, JsonValue]) -> dict[str, JsonValue]:
 class CameraIntrinsics(ContractModel):
     """Pinhole-family intrinsics in oriented-image pixels."""
 
-    model: Literal["SIMPLE_PINHOLE", "PINHOLE", "OPENCV", "UNKNOWN"] = "UNKNOWN"
+    model: Literal["SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL", "PINHOLE", "OPENCV", "UNKNOWN"] = "UNKNOWN"
     width: int = Field(gt=0, strict=True)
     height: int = Field(gt=0, strict=True)
     fx: float = Field(gt=0)

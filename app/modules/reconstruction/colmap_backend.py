@@ -75,23 +75,24 @@ class ColmapBackend:
         logs = workspace.root / "logs"
 
         report("feature_extraction", 0.10)
-        extraction_gpu_flag, matching_gpu_flag = self._gpu_options()
+        extraction_gpu_flag, matching_gpu_flag = self._gpu_options(workspace.root)
         self._run_tool("feature_extraction", [
             "feature_extractor", "--database_path", str(database), "--image_path", str(workspace.images_dir),
             extraction_gpu_flag, "0",
-        ] + (["--ImageReader.mask_path", str(workspace.masks_dir)] if workspace.mask_files else []), cancel, logs)
+        ] + (["--ImageReader.mask_path", str(workspace.masks_dir)] if workspace.mask_files else []),
+            cancel, logs, workspace.root)
 
         report("matching", 0.30)
         self._run_tool("matching", [
             "exhaustive_matcher", "--database_path", str(database), matching_gpu_flag, "0",
-        ], cancel, logs)
+        ], cancel, logs, workspace.root)
 
         report("mapping", 0.55)
         storage_io_path(sparse_dir).mkdir(parents=True, exist_ok=True)  # COLMAP 4 requires the directory
         self._run_tool("mapping", [
             "mapper", "--database_path", str(database), "--image_path", str(workspace.images_dir),
             "--output_path", str(sparse_dir),
-        ], cancel, logs)
+        ], cancel, logs, workspace.root)
 
         model = self._find_model(sparse_dir)
         if model is None:
@@ -103,14 +104,14 @@ class ColmapBackend:
         self._run_tool("export", [
             "model_converter", "--input_path", str(model), "--output_path", str(text_dir),
             "--output_type", "TXT",
-        ], cancel, logs)
+        ], cancel, logs, workspace.root)
         point_cloud = workspace.output_dir / "points3D.ply"
         self._run_tool("export", [
             "model_converter", "--input_path", str(model), "--output_path", str(point_cloud),
             "--output_type", "PLY",
-        ], cancel, logs)
+        ], cancel, logs, workspace.root)
 
-        statistics = self._analyze(model, logs)
+        statistics = self._analyze(model, logs, workspace.root)
         if not point_cloud.is_file():
             raise ReconstructionBackendError("模型已生成但点云导出失败")
         intrinsics, camera_warnings = self._read_cameras(text_dir / "cameras.txt")
@@ -143,11 +144,11 @@ class ColmapBackend:
 
     # -- process handling -------------------------------------------------
 
-    def _gpu_options(self) -> tuple[str, str]:
+    def _gpu_options(self, cwd: Path) -> tuple[str, str]:
         """COLMAP 4 renamed the SIFT flags; detect once per backend instance."""
         if self._gpu_flags is None:
-            extraction_help = self._help_text("feature_extractor")
-            matching_help = self._help_text("exhaustive_matcher")
+            extraction_help = self._help_text("feature_extractor", cwd)
+            matching_help = self._help_text("exhaustive_matcher", cwd)
             extraction = ("--FeatureExtraction.use_gpu" if "--FeatureExtraction.use_gpu" in extraction_help
                           else "--SiftExtraction.use_gpu")
             matching = ("--FeatureMatching.use_gpu" if "--FeatureMatching.use_gpu" in matching_help
@@ -155,26 +156,35 @@ class ColmapBackend:
             self._gpu_flags = (extraction, matching)
         return self._gpu_flags
 
-    def _help_text(self, command: str) -> str:
+    def _help_text(self, command: str, cwd: Path) -> str:
         try:
-            completed = subprocess.run([*self.command, command, "-h"], capture_output=True, text=True,
-                                       timeout=60, stdin=subprocess.DEVNULL)
+            completed = subprocess.run([*self.command, command, "--log_target", "stderr", "-h"],
+                                       capture_output=True, text=True, timeout=60,
+                                       stdin=subprocess.DEVNULL, cwd=str(cwd))
         except (OSError, subprocess.SubprocessError):
             return ""
         return (completed.stdout or "") + (completed.stderr or "")
 
-    def _run_tool(self, label: str, args: Sequence[str], cancel: Callable[[], bool], logs: Path) -> None:
+    @staticmethod
+    def _command_args(args: Sequence[str]) -> list[str]:
+        """Disable COLMAP's own rotating files; our stage log already captures output."""
+        command, *rest = args
+        return [command, "--log_target", "stderr", *rest]
+
+    def _run_tool(self, label: str, args: Sequence[str], cancel: Callable[[], bool], logs: Path,
+                  cwd: Path) -> None:
         if cancel():
             raise ReconstructionCancelled("cancelled")
         logs.mkdir(parents=True, exist_ok=True)
         log_path = logs / f"{label}.log"
+        command = self._command_args(args)
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
         with log_path.open("a", encoding="utf-8", errors="replace") as log:
-            log.write("$ " + " ".join([*self.command, *args]) + "\n")
+            log.write("$ " + " ".join([*self.command, *command]) + "\n")
             log.flush()
             try:
-                process = subprocess.Popen([*self.command, *args], stdout=log, stderr=subprocess.STDOUT,
-                                           stdin=subprocess.DEVNULL, creationflags=creation_flags)
+                process = subprocess.Popen([*self.command, *command], stdout=log, stderr=subprocess.STDOUT,
+                                           stdin=subprocess.DEVNULL, creationflags=creation_flags, cwd=str(cwd))
             except OSError as exc:
                 raise ReconstructionBackendError(f"无法启动 COLMAP（{label}）：{exc.strerror or exc}") from None
 
@@ -226,15 +236,15 @@ class ColmapBackend:
                 candidates.append(entry)
         return candidates[0] if candidates else None
 
-    def _analyze(self, model: Path, logs: Path) -> dict:
+    def _analyze(self, model: Path, logs: Path, cwd: Path) -> dict:
         logs.mkdir(parents=True, exist_ok=True)
         log_path = logs / "analyzer.log"
         with log_path.open("w", encoding="utf-8", errors="replace") as log:
             try:
                 completed = subprocess.run(
-                    [*self.command, "model_analyzer", "--path", str(model)],
+                    [*self.command, *self._command_args(["model_analyzer", "--path", str(model)])],
                     stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                    timeout=self.timeout_seconds,
+                    timeout=self.timeout_seconds, cwd=str(cwd),
                 )
             except subprocess.TimeoutExpired:
                 raise ReconstructionBackendError("COLMAP 统计阶段超时") from None

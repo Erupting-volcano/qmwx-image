@@ -3,6 +3,8 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 import logging
+from pathlib import Path
+import tempfile
 from typing import BinaryIO
 from uuid import UUID, uuid4
 
@@ -66,13 +68,18 @@ class ImageCollectionService:
             if processors is None else processors
         )
 
-    def collect(self, name: str, images: Sequence[ImageInput]) -> ObjectProfile:
+    def collect(self, name: str, images: Sequence[ImageInput],
+                video: BinaryIO | None = None, video_filename: str = "video") -> ObjectProfile:
         """Validate the whole batch, run registered processors, atomically save it."""
         if not isinstance(name, str):
             raise CollectionError("invalid_name", "请填写物体名称。")
         name = name.strip()
         if not name or len(name) > 120 or any(ord(character) < 32 for character in name):
             raise CollectionError("invalid_name", "物体名称需要为 1–120 个字符，且不含控制字符。")
+        if video is not None:
+            if images:
+                raise CollectionError("invalid_input", "请二选一：上传照片，或上传一段视频。")
+            images = self._frames_from_video(video, video_filename)
         if not images or len(images) > self.settings.max_files:
             raise CollectionError("invalid_images", f"请选择 1–{self.settings.max_files} 张图片。")
         if any(not isinstance(image, ImageInput) or not isinstance(image.filename, str)
@@ -141,3 +148,57 @@ class ImageCollectionService:
         """Read a previously persisted collection, including after a process restart."""
         profile, _ = self.storage.read_profile(UUID(str(object_id)))
         return profile
+
+    def _frames_from_video(self, video: BinaryIO, filename: str) -> list[ImageInput]:
+        """Decode one sweep into evenly spaced JPEG frames, then reuse the image path."""
+        try:
+            from app.services.video_frames import VideoFrameError, extract_frames
+        except ImportError as exc:
+            raise CollectionError("video_unsupported", "服务端未安装视频解码组件，请改用照片上传。", 501) from exc
+
+        if not callable(getattr(video, "read", None)):
+            raise CollectionError("invalid_video", "视频输入需要可读取的二进制流。")
+        # PyAV cannot probe an anonymous spool; stage the video so it has a path too.
+        staging = self.settings.data_dir / ".video"
+        staging.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.NamedTemporaryFile(dir=staging, suffix=".video", delete=False)
+        path = Path(temporary.name)
+        try:
+            try:
+                video.seek(0)  # an UploadFile spool is positioned at its end after writing
+            except (AttributeError, OSError):
+                pass
+            copied = 0
+            while True:
+                chunk = video.read(1024 * 1024)
+                if not isinstance(chunk, bytes):
+                    raise CollectionError("invalid_video", "视频流必须返回二进制数据。")
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > self.settings.video_max_bytes:
+                    raise CollectionError(
+                        "video_too_large",
+                        f"视频超过 {self.settings.video_max_bytes // (1024 * 1024)} MiB 上限，请先压缩或裁剪。",
+                        413,
+                    )
+                temporary.write(chunk)
+            temporary.close()
+            try:
+                frames = extract_frames(
+                    path,
+                    max_frames=min(self.settings.video_max_frames, self.settings.max_files),
+                    max_seconds=self.settings.video_max_seconds,
+                    max_pixels=self.settings.max_image_pixels,
+                    fps=self.settings.video_fps,
+                )
+            except VideoFrameError as exc:
+                raise CollectionError(exc.code, str(exc), exc.status_code) from exc
+        finally:
+            if not temporary.closed:
+                temporary.close()
+            path.unlink(missing_ok=True)
+        if not frames:
+            raise CollectionError("video_empty", "视频中没有可用画面。")
+        logger.info("Extracted %s frames from video %s", len(frames), filename)
+        return [ImageInput(frame.filename, frame.stream) for frame in frames]

@@ -95,8 +95,7 @@ def create_app(settings: Settings | None = None,
     application.state.storage = collection_service.storage
     application.state.collection_service = collection_service
     application.state.reconstruction_service = reconstruction_service
-    application.add_middleware(UploadBodyLimitMiddleware,
-                               limit=settings.max_total_bytes + 1024 * 1024)
+    application.add_middleware(UploadBodyLimitMiddleware, limit=settings.max_request_bytes)
     application.mount("/static", StaticFiles(directory=PROJECT_ROOT / "app" / "web"), name="static")
     application.include_router(router)
     application.include_router(reconstruction_router)

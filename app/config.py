@@ -95,6 +95,19 @@ class Settings:
         "DIGITIZER_RECONSTRUCTION_MAX_IMAGES", 120))
     reconstruction_max_artifact_bytes: int = field(default_factory=lambda: _env_int(
         "DIGITIZER_RECONSTRUCTION_MAX_ARTIFACT_BYTES", 536_870_912))
+    video_max_seconds: float = field(default_factory=lambda: float(os.environ.get(
+        "DIGITIZER_VIDEO_MAX_SECONDS", "120")))
+    video_fps: float = field(default_factory=lambda: float(os.environ.get(
+        "DIGITIZER_VIDEO_FPS", "1.5")))
+    video_max_frames: int = field(default_factory=lambda: _env_int(
+        "DIGITIZER_VIDEO_MAX_FRAMES", 30))
+    video_max_bytes: int = field(default_factory=lambda: _env_int(
+        "DIGITIZER_VIDEO_MAX_BYTES", 209_715_200))
+
+    @property
+    def max_request_bytes(self) -> int:
+        """Largest accepted multipart body; a video sweep may exceed the image total."""
+        return max(self.max_total_bytes, self.video_max_bytes) + 1024 * 1024
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data_dir", Path(self.data_dir).expanduser().resolve())
@@ -169,3 +182,12 @@ class Settings:
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= upper:
                 raise ValueError(f"{name} is outside its supported positive range")
+        for name, lower, upper in (("video_max_seconds", 1, 600), ("video_fps", 0.1, 10)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+                    or not lower <= value <= upper:
+                raise ValueError(f"{name} is outside its supported range")
+        if type(self.video_max_frames) is not int or not 1 <= self.video_max_frames <= 200:
+            raise ValueError("video_max_frames is outside its supported range")
+        if type(self.video_max_bytes) is not int or not 1 <= self.video_max_bytes <= 4 * 1024 ** 3:
+            raise ValueError("video_max_bytes is outside its supported range")

@@ -58,6 +58,12 @@
                 <input id="image-input" name="images" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" multiple aria-describedby="upload-hint" />
               </div>
               <p id="upload-hint" class="field-hint upload-hint">最多 20 张，合计不超过 100 MiB。手机 HEIC / HEIF 照片需先转换为 JPEG、PNG 或 WebP。</p>
+              <div class="photos-heading"><label for="video-input">或者用视频扫一圈</label><span id="video-summary">未选择</span></div>
+              <div class="video-field">
+                <p class="field-hint">录一段 10–30 秒的视频，绕物体缓慢移动一圈。服务端按固定间隔自动抽帧，后续流程与逐张拍照完全相同；照片与视频二选一。</p>
+                <label class="file-picker" for="video-input">选择视频</label>
+                <input id="video-input" type="file" accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm" />
+              </div>
               <p id="segmentation-config-note" class="segmentation-config-note">可选：选图后展开每张照片并框选目标。分割默认关闭，当前仅百度后端已实现；启用百度分割后照片会发送至百度云，可能产生调用费用。物体名称不会自动定位目标，未启用时仍可建立基础档案。</p>
               <p id="recognition-config-note" class="segmentation-config-note">物体理解默认关闭。启用后，照片及已校验的观察信息会发送至服务端配置的模型服务商，可能产生费用；材料仅为候选，不作为测量或用户确认结果。</p>
 

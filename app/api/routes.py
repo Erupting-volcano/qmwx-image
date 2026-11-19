@@ -137,10 +137,12 @@ def _parse_segmentation_boxes(values: list, image_count: int) -> list[Normalized
              openapi_extra={
                  "requestBody": {"required": True, "content": {
                      "multipart/form-data": {"schema": {
-                         "type": "object", "required": ["name", "images"],
+                         "type": "object", "required": ["name"],
                          "properties": {
                              "name": {"type": "string", "minLength": 1, "maxLength": 120},
                              "images": {"type": "array", "items": {"type": "string", "format": "binary"}},
+                              "video": {"type": "string", "format": "binary",
+                                        "description": "可选：一段环绕视频，服务端按固定间隔抽帧"},
                              "segmentation_boxes": {"type": "string", "description":
                                  "可选JSON数组，与图片顺序一致，每项null或EXIF转正后[x0,y0,x1,y1]比例坐标"},
                          },
@@ -164,16 +166,25 @@ async def create_object(request: Request) -> dict:
     try:
         names = form.getlist("name")
         uploads = form.getlist("images")
-        if set(form.keys()) - {"name", "images", "segmentation_boxes"}:
-            raise api_error(422, "invalid_upload_form", "表单只接受物体名称、图片和可选目标框。")
+        videos = form.getlist("video")
+        if set(form.keys()) - {"name", "images", "segmentation_boxes", "video"}:
+            raise api_error(422, "invalid_upload_form", "表单只接受物体名称、图片、视频和可选目标框。")
         if len(names) != 1 or not isinstance(names[0], str):
             raise api_error(422, "invalid_name", "请填写一个物体名称。")
-        if any(not isinstance(upload, UploadFile) for upload in uploads):
+        if len(videos) > 1 or any(not isinstance(item, UploadFile) for item in videos):
+            raise api_error(422, "invalid_video", "最多上传一个视频文件。")
+        if videos and uploads:
+            raise api_error(422, "invalid_input", "请二选一：上传照片，或上传一段视频。")
+        if not videos and any(not isinstance(upload, UploadFile) for upload in uploads):
             raise api_error(422, "invalid_images", f"请选择 1–{settings.max_files} 张图片。")
         boxes = _parse_segmentation_boxes(form.getlist("segmentation_boxes"), len(uploads))
         images = [ImageInput(upload.filename or "image", upload.file, box) for upload, box in zip(uploads, boxes)]
         try:
-            profile = await run_in_threadpool(request.app.state.collection_service.collect, names[0], images)
+            profile = await run_in_threadpool(
+                request.app.state.collection_service.collect, names[0], images,
+                videos[0].file if videos else None,
+                (videos[0].filename or "video") if videos else "video",
+            )
         except CollectionError as exc:
             raise api_error(exc.status_code, exc.code, str(exc)) from exc
         return {"object_id": str(profile.object_id), "status": profile.status,

@@ -95,7 +95,7 @@ def test_truncated_multipart_rejects_entire_batch_and_closes_spools(
 
 def test_declared_request_body_over_limit_is_rejected_before_parsing(client_factory):
     client, settings = client_factory(max_total_bytes=1024)
-    limit = settings.max_total_bytes + 1024 * 1024
+    limit = settings.max_request_bytes
     response = client.post(
         "/api/v1/objects", content=b"",
         headers={"Content-Type": CONTENT_TYPE, "Content-Length": str(limit + 1)},
@@ -109,7 +109,7 @@ def test_declared_request_body_over_limit_is_rejected_before_parsing(client_fact
 def test_streamed_body_over_limit_closes_existing_spools(settings, upload_temporary_files):
     # Drive separate ASGI chunks so the first one actually rolls to disk before
     # the next exceeds the limit; no Content-Length header is supplied.
-    settings = Settings(data_dir=settings.data_dir, max_total_bytes=1024 * 1024)
+    settings = Settings(data_dir=settings.data_dir, max_total_bytes=1024 * 1024, video_max_bytes=1024 * 1024)
     application = create_app(settings)
     chunks = [multipart_prefix() + b"x" * (1024 * 1024 + 4096), b"x" * (1024 * 1024)]
     messages = []

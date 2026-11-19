@@ -14,12 +14,14 @@
     "quality-summary", "quality-images", "segmentation-config-note", "segmentation-summary", "segmentation-images",
     "recognition-config-note", "understanding-summary", "understanding-results",
     "reconstruction-summary", "start-reconstruction", "download-point-cloud", "reconstruction-status",
+    "video-input", "video-summary",
   ].map((id) => [id, document.getElementById(id)]));
 
   let selectedFiles = [];
   let isBusy = false;
   let isReadingFiles = false;
   let fileSequence = 0;
+  let selectedVideo = null;
   let currentObjectId = null;
   let reconstructionEnabled = false;
   let reconstructionPoll = null;
@@ -770,7 +772,25 @@
     elements["profile-name"].focus({ preventScroll: true });
   }
 
-  elements["image-input"].addEventListener("change", (event) => addFiles(event.target.files));
+  elements["image-input"].addEventListener("change", (event) => {
+    if ((event.target.files || []).length) {
+      selectedVideo = null;
+      elements["video-input"].value = "";
+      elements["video-summary"].textContent = "未选择";
+    }
+    return addFiles(event.target.files);
+  });
+  elements["video-input"].addEventListener("change", (event) => {
+    const file = (event.target.files || [])[0] || null;
+    selectedVideo = file;
+    elements["video-summary"].textContent = file ? `${file.name} · ${formatBytes(file.size)}` : "未选择";
+    if (file && selectedFiles.length) {
+      selectedFiles.forEach((entry) => { if (entry.objectUrl) URL.revokeObjectURL(entry.objectUrl); });
+      selectedFiles = [];
+      elements["image-input"].value = "";
+      renderFiles();
+    }
+  });
   elements["start-reconstruction"].addEventListener("click", startReconstruction);
   elements["clear-files"].addEventListener("click", () => {
     if (isBusy || isReadingFiles) return;
@@ -825,13 +845,14 @@
       elements["image-input"].focus();
       return;
     }
-    if (selectedFiles.length > limits.maxFiles || selectedFiles.some((entry) => entry.file.size > limits.maxFileBytes) || selectedFiles.reduce((total, entry) => total + entry.file.size, 0) > limits.maxTotalBytes) {
+    if (selectedFiles.length && (selectedFiles.length > limits.maxFiles || selectedFiles.some((entry) => entry.file.size > limits.maxFileBytes) || selectedFiles.reduce((total, entry) => total + entry.file.size, 0) > limits.maxTotalBytes)) {
       showError(`所选照片超过服务当前限制：最多 ${limits.maxFiles} 张，单张 ${formatLimit(limits.maxFileBytes)}，合计 ${formatLimit(limits.maxTotalBytes)}。请移除超限照片。`);
       return;
     }
     const formData = new FormData();
     formData.append("name", name);
     selectedFiles.forEach((entry) => formData.append("images", entry.file, entry.file.name));
+    if (selectedVideo) formData.append("video", selectedVideo, selectedVideo.name);
     if (selectedFiles.some((entry) => entry.segmentationBox)) {
       formData.append("segmentation_boxes", JSON.stringify(selectedFiles.map((entry) => entry.segmentationBox)));
     }
